@@ -121,7 +121,7 @@ Only `kind` and `semantics.summary` are required in a symbol object. The smalles
 }
 ```
 
-All other fields (`signatures`, `stability`, `effects`, `members`, etc.) are optional.
+All other fields (`signatures`, `stability`, `effects`, `aliases`, etc.) are optional.
 
 ### Symbol identification
 
@@ -144,6 +144,41 @@ Examples:
 
 Symbol IDs MUST be stable across patch releases and SHOULD be stable across minor releases. Renaming a symbol constitutes a breaking change and SHOULD be recorded in the `deprecations` section.
 
+### Re-export aliases
+
+Many libraries define a symbol in an internal module and re-export it at the package root — users write `requests.get` even though the function lives in `requests.api`. The optional `aliases` field lists the alternative Symbol IDs under which a symbol is importable:
+
+```json
+"requests.api:get": {
+  "kind": "function",
+  "aliases": ["requests:get"],
+  "semantics": {
+    "summary": "Send a GET request."
+  }
+}
+```
+
+The `symbols` map key remains the **definition site** (preserving ID stability across refactors of the re-export surface); each entry in `aliases` is a full Symbol ID following the same `<module_path>:<entity_path>` grammar. Consumers SHOULD treat an alias as resolving to the same symbol as its canonical entry. For an aliased **class**, member IDs under the alias (`requests:Session#get` for `requests.sessions:Session#get`) are derivable mechanically and MUST NOT require duplicated member entries in the document.
+
+### Structured docstring fields
+
+Generators SHOULD populate the structured documentation fields by parsing each symbol's docstring (Google and NumPy styles at minimum):
+
+```json
+"signatures": [{
+  "params": [{"name": "path", "type": "str", "description": "Path to the CSV file."}],
+  "returns": "DataFrame",
+  "returns_description": "A new DataFrame holding the parsed rows.",
+  "raises": [{"type": "FileNotFoundError", "condition": "If path does not exist."}]
+}],
+"semantics": {
+  "summary": "Read a CSV file.",
+  "examples": [{"code": ">>> read_csv(\"data.csv\")", "description": "Basic usage."}]
+}
+```
+
+Extraction MUST be best-effort and lossless: a docstring entry that does not match an introspected parameter by name MUST NOT introduce a new `param` (introspection is the source of truth for existence and types), and `semantics.description` retains the full unparsed docstring body so that no prose is lost when a section cannot be parsed. `semantics.examples` entries come from doctest blocks (`>>>`) or verbatim code in `Examples` sections.
+
 ### Modules as symbols
 
 Modules are represented using an empty entity path:
@@ -156,13 +191,13 @@ This convention allows a module itself to carry a symbol entry with `"kind": "mo
 
 ### Members and nesting
 
-Class members appear in two places: as top-level symbols (using the `#` separator) and optionally as entries in a `members` array on the parent class symbol. Nested types use the dot separator in the entity path:
+Class members appear as top-level symbols using the `#` separator; the symbol schema does not define a nested member array, so a class entry never embeds its members. Nested types use the dot separator in the entity path:
 
 - Class member: `module:Class#method`
 - Nested type: `module:Outer.Inner`
 - Nested member: `module:Outer.Inner#method`
 
-Producers MAY choose to emit members only at the top level, only nested under their parent's `members` array, or both. Consumers MUST be prepared to handle all three forms.
+Consumers reconstruct class membership from the ID grammar: every key containing `#` belongs to the class named by its prefix.
 
 ### Overloads
 
@@ -349,4 +384,4 @@ Extension keys MUST begin with `x-` followed by at least one character. The core
 
 ## Summary
 
-LCP provides a **compact, precise, and extensible** way to describe libraries at the semantic level. The two required sections — `manifest` and `symbols` — are sufficient to produce a useful document. Optional sections (`deprecations`, `detailed_index`) and optional fields within symbols (`signatures`, `effects`, `stability`, `members`) add progressively more information without breaking basic consumers. By standardising symbol identity and behaviour, LCP enables tools — and AI systems in particular — to understand APIs by intent, contract, and effect, not just syntax.
+LCP provides a **compact, precise, and extensible** way to describe libraries at the semantic level. The two required sections — `manifest` and `symbols` — are sufficient to produce a useful document. Optional sections (`deprecations`, `detailed_index`) and optional fields within symbols (`signatures`, `effects`, `stability`, `aliases`) add progressively more information without breaking basic consumers. By standardising symbol identity and behaviour, LCP enables tools — and AI systems in particular — to understand APIs by intent, contract, and effect, not just syntax.

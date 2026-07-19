@@ -375,6 +375,107 @@ class TestScanPackage:
             "important_template_function",
         ) in function_symbols
 
+    def test_scan_package_skips_baseexception_submodule(self, tmp_path, monkeypatch):
+        """A submodule raising a BaseException subclass at import is skipped.
+
+        Regression for #51: test subpackages call ``pytest.importorskip`` which
+        raises ``Skipped`` (a ``BaseException``, not an ``Exception``). The scan
+        must survive it and keep the importable symbols.
+        """
+        package_name = "scan_basexc_pkg"
+        package_dir = tmp_path / package_name
+        package_dir.mkdir()
+        (package_dir / "__init__.py").write_text('"""Root package."""\n')
+        (package_dir / "good.py").write_text(
+            '"""Good module."""\n\n'
+            "def keep_me():\n"
+            '    """Kept."""\n'
+            '    return "ok"\n'
+        )
+        # Mimics pytest.importorskip: raises a BaseException subclass on import.
+        (package_dir / "hostile.py").write_text(
+            '"""Hostile module."""\n\n'
+            "class _Skipped(BaseException):\n"
+            "    pass\n\n"
+            'raise _Skipped("could not import optional dep")\n'
+        )
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        result = scan_package(package_name, recursive=True)
+
+        function_symbols = {
+            (s.module_path, s.name) for s in result.symbols if s.kind == "function"
+        }
+        assert (f"{package_name}.good", "keep_me") in function_symbols
+        module_paths = {s.module_path for s in result.symbols if s.kind == "module"}
+        assert f"{package_name}.hostile" not in module_paths
+
+    def test_scan_package_excludes_tests_subpackage_by_default(
+        self, tmp_path, monkeypatch
+    ):
+        """``*.tests`` subpackages are excluded by default; ``testing`` stays.
+
+        Regression for #51 part 2: plain ``tests`` pollutes manifests, but
+        ``numpy.testing``-style packages are public API and must be kept.
+        """
+        package_name = "scan_tests_pkg"
+        package_dir = tmp_path / package_name
+        package_dir.mkdir()
+        (package_dir / "__init__.py").write_text('"""Root package."""\n')
+
+        tests_dir = package_dir / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "__init__.py").write_text(
+            '"""Test subpackage."""\n\n'
+            "def test_pollution():\n"
+            '    """Should not be scanned."""\n'
+            '    return None\n'
+        )
+
+        testing_dir = package_dir / "testing"
+        testing_dir.mkdir()
+        (testing_dir / "__init__.py").write_text(
+            '"""Public testing utilities."""\n\n'
+            "def assert_something():\n"
+            '    """Public API."""\n'
+            '    return None\n'
+        )
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        result = scan_package(package_name, recursive=True)
+
+        module_paths = {s.module_path for s in result.symbols if s.kind == "module"}
+        assert f"{package_name}.tests" not in module_paths
+        assert f"{package_name}.testing" in module_paths
+
+        function_symbols = {
+            (s.module_path, s.name) for s in result.symbols if s.kind == "function"
+        }
+        assert (f"{package_name}.tests", "test_pollution") not in function_symbols
+        assert (f"{package_name}.testing", "assert_something") in function_symbols
+
+    def test_scan_package_includes_tests_when_opted_in(self, tmp_path, monkeypatch):
+        """``include_tests=True`` restores scanning of ``*.tests`` subpackages."""
+        package_name = "scan_tests_optin_pkg"
+        package_dir = tmp_path / package_name
+        package_dir.mkdir()
+        (package_dir / "__init__.py").write_text('"""Root package."""\n')
+
+        tests_dir = package_dir / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "__init__.py").write_text(
+            '"""Test subpackage."""\n\n'
+            "def test_included():\n"
+            '    """Now scanned."""\n'
+            '    return None\n'
+        )
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        result = scan_package(package_name, recursive=True, include_tests=True)
+
+        module_paths = {s.module_path for s in result.symbols if s.kind == "module"}
+        assert f"{package_name}.tests" in module_paths
+
 
 class TestInheritedMemberFiltering:
     """Tests for filtering inherited members from external packages."""
@@ -432,3 +533,207 @@ class TestInheritedMemberFiltering:
 
         assert _is_member_from_package(MyDict, "get", "mypackage") is False
         assert _is_member_from_package(MyDict, "keys", "mypackage") is False
+
+
+class TestReexportAliases:
+    """Intra-package re-exports become aliases on the canonical symbol."""
+
+    @pytest.fixture(scope="class")
+    def scanned(self):
+        return scan_package("sample_package")
+
+    def _by_id(self, scanned):
+        return {
+            (s.module_path, s.qualified_name): s for s in scanned.symbols
+        }
+
+    def test_root_reexport_recorded_as_alias(self, scanned):
+        symbols = self._by_id(scanned)
+        core_class = symbols[("sample_package.core", "CoreClass")]
+        assert ("sample_package", "CoreClass") in core_class.aliases
+
+    def test_definition_site_remains_canonical(self, scanned):
+        symbols = self._by_id(scanned)
+        # No symbol is scanned AT the re-export site
+        assert ("sample_package", "CoreClass") not in symbols
+        assert ("sample_package", "core_function") not in symbols
+
+    def test_renamed_reexport_uses_alias_name(self, scanned):
+        symbols = self._by_id(scanned)
+        helper = symbols[("sample_package.extras", "helper")]
+        assert ("sample_package", "aliased_helper") in helper.aliases
+
+    def test_star_reexport_without_all_recorded(self, scanned):
+        symbols = self._by_id(scanned)
+        core_class = symbols[("sample_package.core", "CoreClass")]
+        core_function = symbols[("sample_package.core", "core_function")]
+        assert ("sample_package.convenience", "CoreClass") in core_class.aliases
+        assert (
+            "sample_package.convenience",
+            "core_function",
+        ) in core_function.aliases
+
+    def test_all_filter_limits_aliases(self, scanned):
+        symbols = self._by_id(scanned)
+        core_class = symbols[("sample_package.core", "CoreClass")]
+        core_function = symbols[("sample_package.core", "core_function")]
+        assert ("sample_package.allexport", "CoreClass") in core_class.aliases
+        # core_function is imported by allexport but excluded from __all__
+        assert (
+            "sample_package.allexport",
+            "core_function",
+        ) not in core_function.aliases
+
+    def test_external_reexports_still_skipped(self, scanned):
+        symbols = self._by_id(scanned)
+        # json.loads is re-exported at the root but is NOT part of the package
+        assert ("sample_package", "loads") not in symbols
+        for symbol in scanned.symbols:
+            for alias_module, alias_name in symbol.aliases:
+                assert alias_name != "loads"
+
+    def test_name_collision_keeps_aliases_separate(self, scanned):
+        symbols = self._by_id(scanned)
+        common_a = symbols[("sample_package.mod_a", "common")]
+        common_b = symbols[("sample_package.mod_b", "common")]
+        assert ("sample_package.re_a", "common") in common_a.aliases
+        assert ("sample_package.re_b", "common") not in common_a.aliases
+        assert ("sample_package.re_b", "common") in common_b.aliases
+        assert ("sample_package.re_a", "common") not in common_b.aliases
+
+    def test_symbols_without_reexports_have_no_aliases(self, sample_module):
+        symbols = scan_module(sample_module)
+        assert all(s.aliases == [] for s in symbols)
+
+
+class TestDocstringCapture:
+    """The scanner carries the raw docstring for generator-level parsing."""
+
+    def test_scan_function_captures_raw_docstring(self):
+        def documented(x):
+            """Sum.
+
+            Args:
+                x: The value.
+            """
+
+        symbol = _scan_function(documented, "pkg.mod")
+        assert symbol.docstring == documented.__doc__
+
+    def test_scan_class_captures_raw_docstring_and_members(self):
+        class Widget:
+            """A widget.
+
+            Args:
+                size: The size.
+            """
+
+            def render(self, fmt):
+                """Render.
+
+                Args:
+                    fmt: Format string.
+                """
+
+        symbol = _scan_class(Widget, "pkg.mod")
+        assert symbol.docstring == Widget.__doc__
+        render = next(m for m in symbol.members if m.name == "render")
+        assert render.docstring == Widget.render.__doc__
+
+    def test_non_string_doc_captured_as_none(self):
+        class WeirdDoc:
+            pass
+
+        # sympy-style: __doc__ exposed as a descriptor on the class
+        WeirdDoc.__doc__ = property(lambda self: "computed")
+        symbol = _scan_class(WeirdDoc, "pkg.mod")
+        assert symbol.docstring is None
+        assert symbol.summary is None
+
+    def test_module_docstring_captured(self, sample_module):
+        symbols = scan_module(sample_module)
+        module_symbol = next(s for s in symbols if s.kind == "module")
+        assert module_symbol.docstring == sample_module.__doc__
+
+
+class TestScannedSerialization:
+    """Round-trip Scanned* dataclasses through a plain JSON dict (#52)."""
+
+    def test_round_trip_preserves_default_states_and_tuples(self):
+        import inspect
+        import json
+
+        from lcp.scanner import (
+            ScannedModule,
+            ScannedParam,
+            ScannedSignature,
+            ScannedSymbol,
+            scanned_from_dict,
+            scanned_to_dict,
+        )
+
+        module = ScannedModule(
+            name="pkg",
+            version="1.2.3",
+            symbols=[
+                ScannedSymbol(
+                    name="f",
+                    qualified_name="f",
+                    module_path="pkg",
+                    kind="function",
+                    summary="s",
+                    signature=ScannedSignature(
+                        params=[
+                            ScannedParam(name="a"),  # empty (no default)
+                            ScannedParam(name="b", default=None),  # primitive None
+                            ScannedParam(name="c", default=5),  # primitive
+                            ScannedParam(name="d", default=object()),  # complex
+                        ],
+                        return_type="int",
+                        is_async=True,
+                        raises=["ValueError"],
+                    ),
+                    source_lines=(3, 9),
+                    aliases=[("pkg", "g")],
+                    members=[
+                        ScannedSymbol(
+                            name="m",
+                            qualified_name="C.m",
+                            module_path="pkg",
+                            kind="method",
+                        )
+                    ],
+                )
+            ],
+        )
+
+        rebuilt = scanned_from_dict(json.loads(json.dumps(scanned_to_dict(module))))
+        params = rebuilt.symbols[0].signature.params
+        assert params[0].default is inspect.Parameter.empty
+        assert params[0].has_default is False
+        assert params[1].default is None
+        assert params[1].has_default is True
+        assert params[2].default == 5
+        assert params[3].has_default is True
+        assert not isinstance(params[3].default, (str, int, float, bool))
+        assert rebuilt.symbols[0].source_lines == (3, 9)
+        assert rebuilt.symbols[0].aliases == [("pkg", "g")]
+        assert rebuilt.symbols[0].signature.is_async is True
+        assert rebuilt.symbols[0].members[0].qualified_name == "C.m"
+
+    def test_round_trip_matches_direct_generation(self):
+        """A rebuilt module generates the identical LCP document (symbols)."""
+        import json
+
+        from lcp.generator import generate_lcp
+        from lcp.scanner import scan_package, scanned_from_dict, scanned_to_dict
+
+        scanned = scan_package("json", recursive=False)
+        wire = json.loads(json.dumps(scanned_to_dict(scanned)))
+        rebuilt = scanned_from_dict(wire)
+
+        # Compare the symbol content; the manifest carries a generation
+        # timestamp that differs between two generate_lcp() calls.
+        direct = json.loads(generate_lcp(scanned).to_json())["symbols"]
+        round_tripped = json.loads(generate_lcp(rebuilt).to_json())["symbols"]
+        assert direct == round_tripped

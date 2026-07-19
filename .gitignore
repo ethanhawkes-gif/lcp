@@ -32,6 +32,7 @@ MANIFEST
 *.manifest
 *.spec
 !docs/manifest/
+!docs/architecture/manifest/
 
 # Installer logs
 pip-log.txt
@@ -230,3 +231,7 @@ docs/superpowers/
 
 # MkDocs build output
 site_build/
+
+# Leftover local environments from before the benchmark was split out
+# into the lcp-benchmark repo (evals/ is no longer tracked here)
+/evals/

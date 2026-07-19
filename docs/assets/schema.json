@@ -135,6 +135,11 @@
         },
         "module": { "type": ["string", "null"] },
 
+        "aliases": {
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+
         "signatures": {
           "type": ["array", "null"],
           "items": { "$ref": "#/$defs/signature" }
@@ -167,6 +172,11 @@
         },
 
         "returns": { "$ref": "#/$defs/type_ref" },
+
+        "returns_description": {
+          "type": ["string", "null"],
+          "description": "Prose description of the return value, extracted from the docstring."
+        },
 
         "raises": {
           "type": ["array", "null"],

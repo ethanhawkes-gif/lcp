@@ -1,6 +1,6 @@
 # MCP Server
 
-The `lcp` package ships an [MCP](https://modelcontextprotocol.io/) server that exposes one or more LCP manifests as tools an AI agent can call. This guide shows how to start the server and connect a client.
+The `lcp` package ships an [MCP](https://modelcontextprotocol.io/) server that exposes LCP manifests as tools an AI agent can call. This guide shows how to start the server, connect a client, and what the tool surface looks like.
 
 ## What is MCP?
 
@@ -8,11 +8,11 @@ Model Context Protocol (MCP) is an open standard for connecting AI assistants to
 
 ## How it works
 
-When `lcp serve` or `lcp serve-all` starts, it builds an in-memory `LCPIndex` from one or more LCP manifests. The index organises every symbol by module path, kind, and class membership so that tool calls can be answered without scanning the whole document each time.
+When `lcp serve-all` starts, it waits for the agent to load libraries. Each `resolve_library` call builds an in-memory `LCPIndex` from the library's LCP manifest (local cache → live scan of the installed package → optional registry fetch). The index organises every symbol by module path, kind, and class membership so that tool calls are answered without scanning the whole document each time.
 
-The server communicates over **stdio** using the MCP protocol. The client process spawns `lcp serve …` as a subprocess and exchanges JSON-RPC messages with it. Each MCP tool the server registers appears as a callable function in the agent's tool list. The agent calls these tools to browse library structure (`list_modules`, `list_symbols`), fetch individual symbol details (`get_symbol`), or search by text (`search_symbols`).
+By default the live scan runs in a **disposable child interpreter** rather than inside the server process. Importing a package executes its import-time code, so isolating the scan means a package that crashes on import (or calls `sys.exit`) produces a clean, structured error instead of killing the server, and a slow, heavy import cannot stall concurrent tool calls. The child writes the standard LCP JSON document to stdout — the subprocess protocol is the public document format, nothing private. It also unlocks cross-environment scanning: the server can document packages installed in a *different* virtualenv (see [Scanning environment](#scanning-environment)).
 
-`lcp serve` targets a single pre-built manifest and exposes a fixed set of exploration tools for that one library. `lcp serve-all` is the universal variant: it starts with no manifests loaded and exposes two additional tools — `resolve_library` and `list_libraries` — that allow the agent to load any pip-installed (or registry-available) library at runtime and then query it using the same exploration tools.
+The server communicates over **stdio** using the MCP protocol. The client process spawns `lcp serve-all` as a subprocess and exchanges JSON-RPC messages with it. The server registers exactly **four tools**, designed around a three-call workflow: `resolve_library` → `search` → `get_symbol`. The server's MCP *instructions* field teaches connected agents this workflow automatically.
 
 ```mermaid
 sequenceDiagram
@@ -27,62 +27,18 @@ sequenceDiagram
     MCP->>Idx: build index (symbols, modules, kinds)
     MCP-->>Agent: library loaded (name, version, symbol count)
 
-    Agent->>MCP: list_modules()
-    MCP->>Idx: query module list
-    Idx-->>MCP: ["requests", "requests.auth", …]
-    MCP-->>Agent: module list
+    Agent->>MCP: search("send get request")
+    MCP->>Idx: ranked match (name > summary > description)
+    Idx-->>MCP: top hits
+    MCP-->>Agent: [{id, kind, summary, import}, …]
 
-    Agent->>MCP: list_symbols(module="requests", kind="function")
-    MCP->>Idx: filter by module + kind
-    Idx-->>MCP: symbol summaries
-    MCP-->>Agent: [{id, kind, summary}, …]
-
-    Agent->>MCP: get_symbol("requests:get")
-    MCP->>Idx: lookup by symbol ID
-    Idx-->>MCP: full Symbol record
-    MCP-->>Agent: {signature, parameters, return type, semantics}
+    Agent->>MCP: get_symbol(ids=["requests.api:get"])
+    MCP->>Idx: batch lookup by symbol ID
+    Idx-->>MCP: full Symbol records
+    MCP-->>Agent: {signatures, parameters, import line, usage hints}
 ```
 
-## Single-library mode
-
-Serve a single manifest:
-
-```bash
-lcp serve requests.lcp.json
-```
-
-The server runs over stdio and exits when the client disconnects. All exploration tools operate on the manifest passed on the command line. Use `--name` to override the server name shown to the client (default: `lcp-{library-name}`).
-
-### Client configuration
-
-=== "Claude Code"
-
-    Add to your project's `.mcp.json` or to user-level `~/.claude/mcp.json`:
-
-    ```json
-    {
-      "mcpServers": {
-        "lcp-requests": {
-          "command": "lcp",
-          "args": ["serve", "/absolute/path/to/requests.lcp.json"]
-        }
-      }
-    }
-    ```
-
-    Or use the CLI shortcut:
-
-    ```bash
-    claude mcp add lcp-requests -- lcp serve /absolute/path/to/requests.lcp.json
-    ```
-
-=== "Cursor / generic MCP client"
-
-    Most clients accept the same `mcpServers` shape. Point `command` to the `lcp` executable and pass `serve <manifest>` as the `args` array. Consult your client's documentation for the config file location.
-
-## Universal mode (registry-backed)
-
-For a single server that resolves any requested library, use universal mode:
+## Starting the server
 
 ```bash
 lcp serve-all
@@ -95,7 +51,30 @@ lcp serve-all --cache-dir /tmp/lcp-cache \
     --registry https://raw.githubusercontent.com/zazza123/lcp-registry/refs/heads/main
 ```
 
-Resolution happens in this order for each `resolve_library` call: local cache → live scan of the pip-installed package → registry fetch. See [CLI reference](../cli.md) for all flags.
+Use `--expose` to restrict which packages the agent may load, `--preload` to warm specific libraries at startup, and `--max-response-bytes` to tune the response-size guard. See [CLI reference](../cli.md) for all flags.
+
+### Scanning environment
+
+Live scans run in a child interpreter, and three flags control how:
+
+```bash
+lcp serve-all --scan-python /path/to/project/.venv/bin/python --scan-timeout 120
+```
+
+- `--scan-python` selects the interpreter **whose environment gets scanned** (default: the interpreter running the server). This is how a globally installed `lcp` documents packages that live only in your project's virtualenv — the target environment does not need `lcp` installed; the server makes its own copy importable in the child without shadowing the target's packages.
+- `--scan-timeout` (default 60 s) kills scans that hang, e.g. a package whose import blocks on the network.
+- `--scan-mode inprocess` restores the old behavior of importing packages directly into the server process. Use it only where spawning subprocesses is restricted; the server also falls back to it automatically when a scan subprocess cannot be spawned at all and the scan targets the server's own environment.
+
+When using the [Claude Code plugin](claude-code-plugin.md), set `scan_python` (or `python`) in `.lcp-config.json` instead of passing flags — the plugin forwards them.
+
+!!! warning "Trust model"
+    Scanning imports the package, and importing executes the package's
+    import-time code. The subprocess contains crashes, hangs, and interpreter
+    exits — it is **not a sandbox**: the scanned code runs with your user's
+    permissions. Only resolve packages you would be willing to import yourself.
+
+!!! warning "`lcp serve` is deprecated"
+    The single-manifest `lcp serve <manifest>` command is deprecated. It now starts the same universal server, pre-loaded with the manifest and restricted to that library, and prints a deprecation warning. Use `lcp serve-all --expose <package>` instead.
 
 ### Client configuration
 
@@ -138,61 +117,88 @@ Resolution happens in this order for each `resolve_library` call: local cache �
 
 ## Tools exposed by the server
 
-The table below lists every tool registered by the server. Tools marked **universal only** are available only when running `lcp serve-all`; all others are available in both modes. In universal mode, tools that operate on a library accept an optional `library` parameter to target a specific loaded library; when omitted, the most recently resolved library is used as the default.
+| Tool | Description |
+|---|---|
+| `resolve_library(name, version?)` | Load a library by pip package name: local cache → live scan → registry fetch. Returns name, version, symbol count, and resolution source. Call this first. When the cache or registry serves a version that differs from the locally installed one (or the package is not installed at all), the response carries an honesty flag — see below. |
+| `search(query, library?, module?, kind?, limit?)` | Ranked symbol search — the primary discovery tool. Every hit carries the exact `import` line. Hits present the preferred importable id: a symbol re-exported at the package root appears as `requests:get` with `resolved_via_alias` naming its definition site (`requests.api:get`). An empty query browses: combine with `module=` and/or `kind=` to list contents in deterministic `(kind, name)` order. Default `limit` 20, max 100. |
+| `get_symbol(ids, library?)` | Batch detail lookup: full signatures, required/optional parameters (with per-parameter docstring descriptions), return types and what the return value means (`returns_description`), the exceptions a call can raise (`raises`), usage examples extracted from the docstring (`semantics.examples`), and the correct import line per symbol. Both canonical ids and alias ids resolve (including `#member` forms like `requests:Session#get`); the entry echoes the id you asked for, and `resolved_via_alias` names the definition site when it differs. Classes inline all members as one-line summaries. `usage_hints.returns_classes` resolves a return type to its class id. |
+| `get_overview(library?)` | Library identity (name, version, resolution source) plus the module tree with per-module symbol counts. |
 
-| Tool | Mode | Description |
-|---|---|---|
-| `resolve_library(name)` | Universal only | Scan or fetch a library by pip package name, cache the result, and make it available for exploration. Returns manifest summary and symbol count. |
-| `list_libraries()` | Universal only | List all libraries currently loaded in the server, with version and symbol counts. |
-| `get_usage_guide()` | Both | Return the recommended exploration workflow, cost-optimisation tips, and common mistakes to avoid. Call this first. |
-| `get_manifest()` | Both | Return library metadata: name, version, language, schema version, and compatibility info. |
-| `list_modules()` | Both | Return a sorted list of all module paths in the library. Use this to orient before browsing symbols. |
-| `list_symbols(module, kind)` | Both | Return symbol summaries, optionally filtered by module path and/or kind (`function`, `class`, `method`, `attribute`, `module`, `constant`). |
-| `get_symbol(symbol_id)` | Both | Return the full record for one symbol: signatures, parameter types, return type, semantics, and usage hints. Always call this before writing a call site. |
-| `search_symbols(query, fields)` | Both | Case-insensitive text search across symbol names, summaries, and descriptions. Prefer `list_modules` + `list_symbols` when the target area is known. |
-| `get_class_members(class_id)` | Both | Return all methods and attributes belonging to a class. |
-| `explore_return_type(symbol_id)` | Both | Analyse the return type of a function or method and suggest related classes to explore with `get_class_members`. |
-| `get_suggestions(task_description)` | Both | Match a plain-language task description against module names and symbol summaries, and return suggested starting points. |
+### Version-mismatch honesty
 
-### Recommended workflow
+A live scan always describes the installed package, but a cache or registry hit can describe a different version — for example when the package is not installed locally and the registry's `latest` entry is served. In that case the `resolve_library` response says so explicitly:
 
-The `get_usage_guide` tool encodes the intended call order explicitly, but the short version is:
+```json
+{
+  "status": "loaded",
+  "name": "polars",
+  "version": "1.42.1",
+  "source": "registry",
+  "version_mismatch": true,
+  "installed_version": null,
+  "resolved_version": "1.42.1"
+}
+```
 
-1. `resolve_library` (universal mode only) — load the library.
-2. `list_modules` — find the relevant area of the library.
-3. `list_symbols(module=…, kind=…)` — browse candidates.
-4. `get_symbol` — verify the exact signature before writing code.
-5. `get_class_members` / `explore_return_type` — understand return objects.
+`installed_version` is `null` when the package is not installed in the scanned environment. Requesting an explicit `version=` that cannot be honoured additionally produces a `warning` block with code `version_mismatch`, as before.
+
+### The 3-call workflow
+
+1. `resolve_library("polars")` — load the library.
+2. `search("read csv", library="polars")` — find candidate symbols, ranked, each with its import line.
+3. `get_symbol(ids=["polars:read_csv"])` — verify the exact signature before writing code.
+
+`get_overview` helps when you need orientation before searching; browsing a specific module is `search("", module="polars.io")`.
+
+### Errors and response caps
+
+Every tool returns a structured error dict on failure, with a stable shape:
+
+```json
+{
+  "error": {
+    "code": "ambiguous_library",
+    "message": "Multiple libraries are loaded; pass library=<name>.",
+    "hint": "Pick one of loaded_libraries and retry with library=<name>.",
+    "loaded_libraries": ["requests", "httpx"]
+  }
+}
+```
+
+Rules worth knowing:
+
+- With **one** library loaded, the `library` parameter may be omitted; with **two or more**, it is required — otherwise the server returns `ambiguous_library` listing the loaded names.
+- Symbol ids that don't resolve are reported per-id in `not_found`, never as a protocol error.
+- Every list-returning response is size-capped (default 25 000 bytes, configurable with `--max-response-bytes`). Capped responses set `"truncated": true` and include a hint describing how to fetch the rest (e.g. narrower `search`, follow-up `get_symbol` with the `not_returned` ids). Within a single symbol entry, docstring examples are dropped first (`"examples_truncated": true`) before the description is shortened, so signature data always survives.
 
 ## Programmatic usage
 
 You can create and start the server from Python directly:
 
 ```python
-from lcp.mcp_server import create_server, create_universal_server, run_server
+from lcp.mcp_server import create_universal_server
 
-# Single-library mode
-server = create_server(
-    "path/to/requests.lcp.json",
-    name="lcp-requests",          # optional; defaults to lcp-{library-name}
-)
-server.run()
-
-# Universal mode
 server = create_universal_server(
     name="lcp-universal",
     cache_dir="~/.lcp/cache",     # optional
     registry_url="https://raw.githubusercontent.com/zazza123/lcp-registry/refs/heads/main",  # optional
+    expose=["requests"],          # optional allow-list
+    preload=["requests"],         # optional warm-up
 )
-server.run()
-
-# Convenience wrapper (single-library)
-run_server("path/to/requests.lcp.json")
+server.run()                       # serve on stdio (blocks)
 ```
 
-`create_server` and `create_universal_server` both return a `FastMCP` instance. You can register additional tools on it before calling `.run()`.
+`create_universal_server` returns an `LCPServer` dataclass bundling the underlying FastMCP instance (`server.mcp`), the library index registry (`server.index`), and the raw tool callables (`server.tools`) for in-process use without the MCP protocol:
+
+```python
+server = create_universal_server(no_cache=True)
+print(server.tools["resolve_library"]("requests")["symbol_count"])
+print(server.tools["search"]("send get request")["results"][0])
+```
+
+The deprecated `create_server(manifest_path)` / `run_server(manifest_path)` wrappers build the same server pre-loaded with one manifest and emit a `DeprecationWarning`.
 
 ## See also
 
 - [Claude Code plugin](claude-code-plugin.md) — packaged version of `lcp serve-all` for Claude Code.
-- [CLI reference](../cli.md) — all flags for `serve` and `serve-all`.
+- [CLI reference](../cli.md) — all flags for `serve-all`.

@@ -275,3 +275,30 @@ class TestDetailedIndex:
             implementation=Artifact(path="src/main.py", lines=[10, 20])
         )
         assert entry.implementation.path == "src/main.py"
+
+
+def test_symbol_aliases_field_roundtrip():
+    symbol = Symbol(
+        kind=SymbolKind.FUNCTION,
+        semantics=Semantics(summary="S."),
+        aliases=["pkg:f"],
+    )
+    assert symbol.model_dump(exclude_none=True)["aliases"] == ["pkg:f"]
+
+
+def test_symbol_aliases_default_none():
+    symbol = Symbol(kind=SymbolKind.FUNCTION, semantics=Semantics(summary="S."))
+    assert symbol.aliases is None
+
+
+def test_signature_returns_description_roundtrip():
+    sig = Signature(returns="str", returns_description="The rendered result.")
+    dumped = sig.model_dump(exclude_none=True, by_alias=True)
+    assert dumped["returns_description"] == "The rendered result."
+    assert Signature.model_validate(dumped).returns_description == (
+        "The rendered result."
+    )
+
+
+def test_signature_returns_description_defaults_to_none():
+    assert Signature().returns_description is None

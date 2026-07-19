@@ -11,13 +11,14 @@ When you install the plugin, Claude Code gets:
 | **MCP Server** | `lcp serve-all` starts automatically on every session and exposes your Python environment's libraries as browsable MCP tools |
 | **`lcp-universal` skill** | Teaches Claude to call `resolve_library()` before writing code that uses a third-party library — proactive, not reactive |
 | **`lcp-usage` skill** | Guides Claude on when and how to use LCP tools for library research |
-| **`lcp-configure` skill** | Walks through setting up or repairing `.lcp.json`; triggers automatically when the MCP server won't start or a library won't resolve |
+| **`lcp-configure` skill** | Walks through setting up or repairing `.lcp-config.json`; triggers automatically when the MCP server won't start or a library won't resolve |
 | **`/lcp:resolve <pkg>`** | Slash command: resolve a library and get a summary of its public API |
 | **`/lcp:scan <pkg>`** | Slash command: scan a package and produce a structured module and symbol overview |
-| **`/lcp:configure`** | Slash command: guided, step-by-step `.lcp.json` setup with verification; pass a symptom to jump straight to repair |
+| **`/lcp:configure`** | Slash command: guided, step-by-step `.lcp-config.json` setup with verification; pass a symptom to jump straight to repair |
 | **Library explorer subagent** | A read-only Claude Haiku subagent for deep API research; runs independently so it doesn't consume your session's context |
-| **Session hook** | Auto-generates `.lcp.json` for the active project when absent, seeding it from `settings.json` `pluginConfigs` values |
-| **Registry support** | `registries` field in `.lcp.json` for connecting to a private or team registry with pre-built manifests |
+| **Session hook** | Auto-generates `.lcp-config.json` for the active project when absent, seeding it from `settings.json` `pluginConfigs` values |
+| **Verification reminder hook** | If Claude reaches its first Python file write without having consulted `lcp`, a `PreToolUse` hook holds that one write and reminds it to verify the library APIs first — at most once per session, Python files only |
+| **Registry support** | `registries` field in `.lcp-config.json` for connecting to a private or team registry with pre-built manifests |
 
 ## Installation
 
@@ -60,9 +61,9 @@ That's it. Claude Code reads the plugin manifest, registers the MCP server, the 
     During `/plugin install`, Claude Code prompts you to enter `userConfig` values such as
     `registries`. These are stored in `settings.json` under `pluginConfigs.lcp@lcp.options`
     and delivered to the hook at the next full session start, which seeds them into
-    `.lcp.json` when the file does not yet exist.
+    `.lcp-config.json` when the file does not yet exist.
 
-    To change an option later, edit `.lcp.json` directly (preferred), or edit
+    To change an option later, edit `.lcp-config.json` directly (preferred), or edit
     `pluginConfigs.lcp@lcp.options` in `settings.json` directly. To re-trigger the install
     prompt, run `claude plugin disable lcp && claude plugin enable lcp`.
 
@@ -78,7 +79,7 @@ claude --plugin-dir /path/to/lcp/plugin/lcp
     Use `/reload-plugins` to hot-reload skills, agents, hooks, and MCP after edits.
     Run `claude plugin validate ./plugin/lcp` to validate the manifest.
     Changes to `userConfig` values require a **full restart** to be re-delivered to the hook
-    and propagated into `.lcp.json`.
+    and propagated into `.lcp-config.json`.
 
 ### Alternative: MCP-only (Cursor, Claude Desktop)
 
@@ -113,21 +114,26 @@ Once the plugin is active, the typical interaction looks like this:
 User: "Set up FastAPI routes with proper dependency injection"
 
 Claude:
-  1. resolve_library("fastapi")                → scanned + cached
-  2. list_modules()                            → finds fastapi.routing
-  3. list_symbols(module="fastapi.routing")    → finds APIRouter, Depends
-  4. get_symbol("fastapi.routing:APIRouter")   → full signature
-  5. get_class_members("fastapi:Depends")      → understands dependencies
-  6. Writes accurate, idiomatic code
+  1. resolve_library("fastapi")                       → scanned + cached
+  2. search("routing dependency", library="fastapi")  → ranked hits + import lines
+  3. get_symbol(ids=["fastapi.routing:APIRouter",
+                     "fastapi:Depends"])              → full signatures, members inline
+  4. Writes accurate, idiomatic code
 ```
 
 The `lcp-universal` skill drives this flow automatically: whenever Claude detects that a task involves an external Python library, it calls `resolve_library("package")` first. The MCP server checks `~/.lcp/cache/` for a cached manifest; if none is found, it scans the pip-installed package on the fly and caches the result. Subsequent calls to the same library in the same session are instant.
 
-The skills, commands, and subagent are guidance and convenience layers on top of the MCP server — they don't change what the server does, they change how Claude uses it.
+The skills, commands, and subagent are guidance and convenience layers on top of the MCP server — they don't change what the server does, they change how Claude uses it. A `PreToolUse` hook backs the skill deterministically: the first time a session writes a `.py` file without any prior `lcp` call, the write is held once with a reminder to verify — repeating the write (or calling `resolve_library`) proceeds normally.
 
-## Configuration: `.lcp.json`
+## Configuration: `.lcp-config.json`
 
-The plugin reads a `.lcp.json` file to determine how to launch `lcp` for the current project. The `SessionStart` hook **auto-generates** this file from your `pluginConfigs` settings when it is absent; after that, edit the file directly.
+The plugin reads a `.lcp-config.json` file to determine how to launch `lcp` for the current project. The `SessionStart` hook **auto-generates** this file from your `pluginConfigs` settings when it is absent; after that, edit the file directly.
+
+!!! note "Renamed from `.lcp.json`"
+    Earlier plugin versions named this file `.lcp.json`, which collided with
+    the manifest extension (`<package>.lcp.json`). A legacy `.lcp.json` is
+    still read (with a deprecation notice on the server's stderr) when no
+    `.lcp-config.json` exists — rename the file to silence it.
 
 !!! tip "Guided setup"
     Prefer not to hand-edit JSON? Run **`/lcp:configure`** for a step-by-step
@@ -141,7 +147,7 @@ The plugin reads a `.lcp.json` file to determine how to launch `lcp` for the cur
 
 The wrapper checks these paths in order, using the first that exists:
 
-1. `${CLAUDE_PROJECT_DIR}/.lcp.json` — per-project (safe to check in to the repository)
+1. `${CLAUDE_PROJECT_DIR}/.lcp-config.json` — per-project (safe to check in to the repository)
 2. `~/.lcp/config.json` — global fallback
 
 ### Schema
@@ -150,11 +156,13 @@ All fields are optional:
 
 ```jsonc
 {
-  "command":    "/path/to/lcp",            // explicit lcp binary
-  "python":     "/path/to/python",         // interpreter → `python -m lcp`
-  "registries": ["https://..."],           // registry URLs → lcp serve-all --registry
-  "expose":     ["fastapi", "pydantic"],   // allow-list; omitted/empty = expose all
-  "preload":    ["fastapi"]                // packages resolved at server startup
+  "command":      "/path/to/lcp",            // explicit lcp binary
+  "python":       "/path/to/python",         // interpreter → `python -m lcp`; also the default scan environment
+  "registries":   ["https://..."],           // registry URLs → lcp serve-all --registry
+  "expose":       ["fastapi", "pydantic"],   // allow-list; omitted/empty = expose all
+  "preload":      ["fastapi"],               // packages resolved at server startup
+  "scan_python":  "/path/to/venv/python",    // interpreter whose env gets SCANNED → --scan-python
+  "scan_timeout": 60                         // seconds before a scan subprocess is killed → --scan-timeout
 }
 ```
 
@@ -162,7 +170,7 @@ All fields are optional:
 
 ### Private registries
 
-To use a team registry with pre-built manifests for internal packages, add its URL to `registries` in `.lcp.json`:
+To use a team registry with pre-built manifests for internal packages, add its URL to `registries` in `.lcp-config.json`:
 
 ```jsonc
 {
@@ -174,7 +182,7 @@ Only the first URL in the list is used as the active registry. The value maps to
 
 ### `expose` and `preload`
 
-These two fields are per-project settings in `.lcp.json` only — they are not available as `userConfig` options.
+These two fields are per-project settings in `.lcp-config.json` only — they are not available as `userConfig` options.
 
 - **`expose`**: An allow-list that restricts which packages `resolve_library` can expose. Useful in large monorepos to avoid noise. Omit or leave empty to expose all packages.
 - **`preload`**: A list of packages that `lcp` scans at server startup so they are ready immediately, without waiting for the first `resolve_library` call.
@@ -186,12 +194,27 @@ These two fields are per-project settings in `.lcp.json` only — they are not a
 }
 ```
 
+### `scan_python` and `scan_timeout`
+
+The server scans packages in a child interpreter, and `.lcp-config.json` chooses **which environment gets scanned**:
+
+- **`scan_python`**: explicit path to the Python interpreter whose installed packages `resolve_library` documents. The target environment does **not** need `lcp` installed — the server makes its own copy importable in the child without shadowing the target's packages.
+- **`scan_timeout`**: seconds before a hung scan subprocess is killed (default 60).
+
+When `scan_python` is absent, the plugin falls back to the `python` field: pointing `python` at your project venv means that venv is what gets scanned, *even when the server itself ends up running from a global `lcp` install* (for example because `lcp` is not installed in the project venv and the launcher probe moved on). Set `scan_python` explicitly only when the environment to scan differs from the interpreter in `python`.
+
+```jsonc
+{
+  "python": "/path/to/project/.venv/bin/python"   // scanned env, and launcher if lcp is installed there
+}
+```
+
 ## Launcher resolution order
 
 The wrapper probes each candidate with `--version` before use; the first that succeeds is used to run `lcp serve-all`:
 
-1. `.lcp.json` → `command` (explicit binary path)
-2. `.lcp.json` → `python` → `python -m lcp`
+1. `.lcp-config.json` → `command` (explicit binary path)
+2. `.lcp-config.json` → `python` → `python -m lcp`
 3. Auto-detected project venv under `${CLAUDE_PROJECT_DIR}`: `.venv/bin/lcp`, `.venv/bin/python -m lcp`, `venv/bin/lcp`, `venv/bin/python -m lcp`
 4. Active virtualenv via `$VIRTUAL_ENV`: `$VIRTUAL_ENV/bin/lcp`, `$VIRTUAL_ENV/bin/python -m lcp`
 5. `uv run --project <dir> --with lcp lcp` if `uv` is present — ephemeral, layers `lcp` onto the project env so it can see project packages without a permanent install
@@ -200,10 +223,14 @@ The wrapper probes each candidate with `--version` before use; the first that su
 If none of the above resolve, the plugin emits an actionable error explaining how to install or configure `lcp` — never a bare `-32000`.
 
 !!! tip "Why the project venv matters"
-    `lcp` introspects packages by importing them in-process via `importlib`. It can only
-    document libraries installed in the **same environment it runs in**. Steps 1–4 specifically
-    target your project's environment so private dependencies are reachable. Step 5 (global)
-    is a fallback that covers publicly registered packages only.
+    `lcp` introspects packages by importing them, so it must know **which
+    environment to import from**. Steps 1–4 target your project's environment
+    directly. And even when the *launcher* falls through to a global `lcp`
+    (steps 5–6), scanning still reaches your project venv: scans run in a
+    child interpreter chosen by `scan_python` — or, in its absence, the
+    `python` field — so private dependencies stay reachable. A global install
+    with no `python`/`scan_python` configured scans its own (global)
+    environment and covers publicly registered packages only.
 
 ## Troubleshooting
 
@@ -223,7 +250,7 @@ If none of the above resolve, the plugin emits an actionable error explaining ho
     ```
     The plugin auto-detects `.venv` — no extra config needed.
 
-    **Or pin an explicit path in `.lcp.json`**:
+    **Or pin an explicit path in `.lcp-config.json`**:
     ```jsonc
     { "command": "/path/to/venv/bin/lcp" }
     ```
@@ -232,10 +259,16 @@ If none of the above resolve, the plugin emits an actionable error explaining ho
     { "python": "/path/to/venv/bin/python" }
     ```
 
-    **Or install globally** (public packages and registry-backed manifests only):
+    **Or install globally** and point the scan at your project venv:
     ```bash
     pipx install lcp
     ```
+    ```jsonc
+    { "python": "/path/to/project/.venv/bin/python" }
+    ```
+    With `python` (or `scan_python`) set, a global `lcp` still documents the
+    packages installed in your project venv; without it, a global install
+    covers publicly registered packages only.
 
 !!! warning "MCP server not starting"
     Run `lcp serve-all` manually in your terminal to check for errors. On Unix systems, `bin/serve.sh` must be executable — run `chmod +x plugin/lcp/bin/serve.sh` if needed. Confirm Claude Code shows `lcp` in its active MCP servers list.

@@ -87,6 +87,24 @@ class TestScanCommand:
         output = result.output
         assert '"manifest"' in output
 
+    def test_scan_excludes_tests_by_default(self, runner):
+        """`*.tests` subpackages are excluded from the manifest by default (#51)."""
+        pytest.importorskip("jsonschema")
+        result = runner.invoke(main, ["scan", "jsonschema", "--no-validate"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert not any(sid.startswith("jsonschema.tests") for sid in data["symbols"])
+
+    def test_scan_include_tests_flag(self, runner):
+        """`--include-tests` restores scanning of `*.tests` subpackages (#51)."""
+        pytest.importorskip("jsonschema")
+        result = runner.invoke(
+            main, ["scan", "jsonschema", "--include-tests", "--no-validate"]
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert any(sid.startswith("jsonschema.tests") for sid in data["symbols"])
+
     def test_scan_custom_indent(self, runner):
         result = runner.invoke(main, ["scan", "json", "--indent", "4"])
         assert result.exit_code == 0
@@ -336,6 +354,18 @@ class TestDiffCommand:
         assert "deprecations" not in data
 
 
+class TestServeCommand:
+    """Tests for the deprecated serve CLI command."""
+
+    def test_serve_warns_deprecated(self, runner, sample_lcp_file):
+        with patch("lcp.cli.run_mcp_server") as mock_run:
+            result = runner.invoke(main, ["serve", str(sample_lcp_file)])
+        assert result.exit_code == 0
+        assert "deprecated" in result.output.lower()
+        assert "serve-all" in result.output
+        mock_run.assert_called_once()
+
+
 class TestServeAllCommand:
     """Tests for the serve-all CLI command."""
 
@@ -346,6 +376,15 @@ class TestServeAllCommand:
         assert "resolve_library" in result.output
         assert "--cache-dir" in result.output
         assert "--no-cache" in result.output
+        assert "--max-response-bytes" in result.output
+
+    def test_max_response_bytes_flag(self, runner):
+        with patch("lcp.cli.run_universal_server") as mock_run:
+            result = runner.invoke(
+                main, ["serve-all", "--max-response-bytes", "10000"]
+            )
+        assert result.exit_code == 0
+        assert mock_run.call_args.kwargs["max_response_bytes"] == 10000
 
 
 class TestPublishCommand:
@@ -378,8 +417,17 @@ class TestPublishCommand:
         assert "test-lib" in result.output
 
     def test_publish_no_token(self, runner):
-        """Publishing without a token should fail."""
-        result = runner.invoke(main, ["publish", "json"])
+        """Publishing without a token should fail.
+
+        The token env vars are removed for the invocation: --token reads
+        LCP_GITHUB_TOKEN / GITHUB_TOKEN, so on a machine where either is
+        set the un-isolated test would publish to the real registry.
+        """
+        result = runner.invoke(
+            main,
+            ["publish", "json"],
+            env={"LCP_GITHUB_TOKEN": None, "GITHUB_TOKEN": None},
+        )
         assert result.exit_code == 1
         assert "token" in result.output.lower()
 
@@ -439,3 +487,38 @@ class TestDocgenCommand:
         assert "--provider" in result.output
         assert "--dry-run" in result.output
         assert "--workers" in result.output
+
+
+class TestServeAllScanOptions:
+    """serve-all must pass the scan options through to the server."""
+
+    def _invoke_with_capture(self, runner, monkeypatch, args):
+        from lcp import cli
+
+        captured: dict = {}
+        monkeypatch.setattr(
+            cli, "run_universal_server", lambda **kw: captured.update(kw)
+        )
+        result = runner.invoke(main, ["serve-all", *args])
+        assert result.exit_code == 0, result.output
+        return captured
+
+    def test_scan_options_are_passed_through(self, runner, monkeypatch):
+        captured = self._invoke_with_capture(
+            runner,
+            monkeypatch,
+            [
+                "--scan-mode", "inprocess",
+                "--scan-python", "/x/py",
+                "--scan-timeout", "30",
+            ],
+        )
+        assert captured["scan_mode"] == "inprocess"
+        assert captured["scan_python"] == "/x/py"
+        assert captured["scan_timeout"] == 30.0
+
+    def test_scan_defaults(self, runner, monkeypatch):
+        captured = self._invoke_with_capture(runner, monkeypatch, [])
+        assert captured["scan_mode"] == "subprocess"
+        assert captured["scan_python"] is None
+        assert captured["scan_timeout"] == 60.0

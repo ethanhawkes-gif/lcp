@@ -25,14 +25,16 @@ Class members (methods, properties) are stored inline inside the parent `Scanned
 
 ### Entry Points
 
-- `scan_package(package_name, include_private, recursive)` — top-level function; imports the package, calls `scan_module()` on the root module, then iterates over submodules if `recursive=True`
+- `scan_package(package_name, include_private, recursive, include_tests)` — top-level function; imports the package, calls `scan_module()` on the root module, then iterates over submodules if `recursive=True`
 - `scan_module(module, include_private, _visited)` — scans one `ModuleType`; uses a `_visited` set of object IDs to avoid processing the same module twice (handles circular imports)
 
 ### Submodule Discovery
 
 `_iter_submodules()` uses `pkgutil.iter_modules()` for standard packages. It also handles namespace packages (directories without `__init__.py`) by iterating the package's `__path__` entries directly and trying to import any subdirectory that is a valid Python identifier.
 
-Modules that fail to import are silently skipped.
+Submodule discovery is fail-open: a submodule that raises at import time is skipped and the walk continues, so one hostile module can never abort the whole scan. The guard catches any `BaseException` (not only `Exception`) — `KeyboardInterrupt` and `SystemExit` remain handled explicitly, but `BaseException` subclasses raised by import-time probes are caught too. This matters because test modules commonly call `pytest.importorskip()`, which raises `Skipped` (a `BaseException`, not an `Exception`); without this, any package whose test suite probes an absent optional dependency (`pandas`, `scipy`, `pyarrow`) would fail to scan at all.
+
+Test subpackages are excluded by default. Any subpackage whose leaf name is exactly `tests` is skipped *before* it is imported — controlled by the `include_tests` flag (default off). The rationale is twofold: test packages are not public API and would otherwise dominate a manifest (roughly a third of the raw symbols for large scientific packages), and skipping them before import also sidesteps the `importorskip` failure mode above at the source. The rule matches the leaf name exactly, so public utilities such as `numpy.testing` (leaf `testing`) are always included. Pass `include_tests=True` to scan test packages anyway.
 
 ### Public Symbol Rules
 
@@ -42,7 +44,16 @@ Modules that fail to import are silently skipped.
 2. Names in the **public dunders allowlist** always pass (e.g. `__init__`, `__call__`, operators). See [index.md](index.md#what-gets-scanned) for the full list.
 3. All other names starting with `_` are excluded.
 
-When a module defines `__all__`, that set takes precedence: only names listed there are scanned (after applying the public-name check). Re-exported symbols — where `obj.__module__` differs from the current module's name — are also skipped to avoid documenting the same symbol in multiple places.
+When a module defines `__all__`, that set takes precedence: only names listed there are scanned (after applying the public-name check).
+
+### Re-export Aliases
+
+Re-exported symbols — where `obj.__module__` differs from the current module's name — are never scanned twice. What happens instead depends on where the object comes from:
+
+- **Intra-package re-export** (the origin module is inside the scanned package, e.g. `requests/__init__.py` re-exporting `requests.api.get`): `scan_module()` records an `_AliasRecord` with the origin, the re-exporting module, and the local name (which may differ for `from x import y as z` renames). After all modules are scanned, `_attach_aliases()` resolves each record onto its canonical `ScannedSymbol`, filling its `aliases` list with `(module_path, name)` pairs. Records whose target was never scanned are dropped.
+- **External re-export** (the origin is another package, e.g. `from json import loads` inside a scanned package): skipped entirely, exactly as before.
+
+The definition site remains the canonical identity; the generator turns the recorded pairs into the additive `Symbol.aliases` field (a sorted list of full Symbol IDs, e.g. `requests:get`), so a symbol is findable under the import path users actually write while the `symbols` map key stays stable. Why this design: agents and users think in documented import paths (`requests.get`), but rewriting IDs to the re-export site would break ID stability across internal refactors — aliases give both.
 
 ### Docstring Parsing
 
@@ -50,7 +61,7 @@ When a module defines `__all__`, that set takes precedence: only names listed th
 - **summary** — the first paragraph (consecutive non-empty lines joined with a space)
 - **description** — everything after the first blank line, stripped
 
-Both fields may be `None` if no docstring exists.
+Both fields may be `None` if no docstring exists. The scanner additionally captures the raw docstring verbatim on `ScannedSymbol.docstring` (guarded by the same non-string check — some classes expose `__doc__` as a descriptor). This is capture only: no structured parsing happens during member iteration, so a hostile package cannot crash the scan through its docstrings. Structured parsing is deferred to the generator stage.
 
 ### Type Hint Resolution
 
@@ -80,9 +91,20 @@ The generator converts the `ScannedModule` tree into an `LCPDocument`. All logic
 
 `_convert_symbol(scanned)` maps each `ScannedSymbol` to a `(symbol_id, Symbol)` pair:
 
-1. **Semantics**: `summary` from the parsed docstring, or a fallback `"{kind} {name}"` string; `description` if present.
-2. **Signatures**: constructed only for `function`, `method`, and `class` kinds. The class signature is the `__init__` signature captured by the scanner.
+1. **Semantics**: `summary` from the parsed docstring, or a fallback `"{kind} {name}"` string; `description` if present; `examples` extracted from the docstring's `Examples` sections (see below).
+2. **Signatures**: constructed only for `function`, `method`, and `class` kinds. The class signature is the `__init__` signature captured by the scanner. Parameter descriptions, `raises` entries and the `returns_description` come from the docstring (see below).
 3. **Kind mapping**: scanner strings (`"function"`, `"class"`, …) → `SymbolKind` enum values.
+
+### Structured Docstring Extraction
+
+`extract_structured()` in `src/lcp/docstrings.py` parses the raw docstring captured by the scanner (Google and NumPy styles, auto-detected via the `docstring_parser` dependency) and returns a `DocstringExtras` value holding per-parameter descriptions, `(exception, condition)` pairs, the return-value prose, and `(code, description)` example pairs. `_convert_symbol()` calls it once per symbol and threads the result through `_convert_signature()` and `_convert_param()`.
+
+Design rules, in order of importance:
+
+- **Fail-open.** Any parser exception makes `extract_structured()` return `None` and the generator emits exactly the pre-Phase-4 output (summary + raw description). A docstring can degrade the enrichment, never the manifest.
+- **Introspection wins.** Docstring parameter entries are merged with introspected parameters *by name*: a matching entry contributes only its description text; an unmatched entry (a renamed or removed parameter that the docstring still mentions) never invents a `Param`, and types always come from introspection.
+- **No information loss.** `semantics.description` keeps the scanner's full post-summary remainder even when parsing succeeds. This is deliberate duplication: the Google-style parser silently drops unknown sections (such as a `Note:` appearing after `Args:`), so rebuilding the description from parser output would lose prose. The measured gzip cost is ~10–30 % on real libraries.
+- **Examples via doctest.** `Examples` sections containing `>>>` blocks are re-rendered through the stdlib `doctest` parser (canonical prompts plus expected output, surrounding prose becoming the example description); sections without `>>>` are taken verbatim. A malformed doctest is dropped without discarding the docstring's other structured fields.
 
 ### Class Member Flattening
 
@@ -154,5 +176,5 @@ The `detailed_index` dict maps symbol IDs to `DetailedIndexEntry` objects, each 
 - [MCP Server](../mcp_server/index.md) - Loads the `.lcp.json` output and exposes it over MCP
 
 ---
-**Last Updated:** February 2026
+**Last Updated:** July 2026
 **Status:** Implemented

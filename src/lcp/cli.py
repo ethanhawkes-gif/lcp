@@ -50,6 +50,12 @@ def main():
     help="Don't scan submodules recursively.",
 )
 @click.option(
+    "--include-tests",
+    is_flag=True,
+    default=False,
+    help="Include '*.tests' subpackages (excluded by default).",
+)
+@click.option(
     "--validate/--no-validate",
     default=True,
     help="Validate output against LCP schema (default: enabled).",
@@ -71,6 +77,7 @@ def scan(
     output: str | None,
     include_private: bool,
     no_recursive: bool,
+    include_tests: bool,
     validate: bool,
     indent: int,
     coverage: str | None,
@@ -94,6 +101,7 @@ def scan(
             package,
             include_private=include_private,
             recursive=not no_recursive,
+            include_tests=include_tests,
         )
 
         # Generate LCP
@@ -169,12 +177,19 @@ def scan(
     default=False,
     help="Don't scan submodules recursively.",
 )
+@click.option(
+    "--include-tests",
+    is_flag=True,
+    default=False,
+    help="Include '*.tests' subpackages (excluded by default).",
+)
 def coverage(
     package: str,
     output: str | None,
     format: str,
     include_private: bool,
     no_recursive: bool,
+    include_tests: bool,
 ):
     """Generate documentation coverage report for a Python package.
 
@@ -194,6 +209,7 @@ def coverage(
             package,
             include_private=include_private,
             recursive=not no_recursive,
+            include_tests=include_tests,
         )
 
         # Determine output format
@@ -256,12 +272,12 @@ main.add_command(validate_cmd, name="validate")
     help="Server name for MCP identification (default: lcp-{library-name}).",
 )
 def serve(manifest: str, name: str | None):
-    """Start an MCP server for an LCP manifest.
+    """Start an MCP server for an LCP manifest (deprecated: use serve-all).
 
     MANIFEST is the path to an LCP JSON file to serve.
 
-    The server uses stdio transport and exposes tools for exploring
-    and querying the library's API.
+    The server uses stdio transport and exposes the same tools as
+    `lcp serve-all`, pre-loaded with the manifest and restricted to it.
 
     Examples:
 
@@ -269,6 +285,11 @@ def serve(manifest: str, name: str | None):
 
         lcp serve numpy.lcp.json --name numpy-docs
     """
+    click.echo(
+        "Warning: 'lcp serve' is deprecated; use "
+        "'lcp serve-all --expose <package>' instead.",
+        err=True,
+    )
     try:
         run_mcp_server(manifest, name=name)
     except FileNotFoundError as e:
@@ -329,6 +350,43 @@ def serve(manifest: str, name: str | None):
         "Repeat the flag for multiple packages."
     ),
 )
+@click.option(
+    "--max-response-bytes",
+    type=int,
+    default=25_000,
+    show_default=True,
+    help="Byte budget for list-returning tool responses (context blowout guard).",
+)
+@click.option(
+    "--scan-mode",
+    type=click.Choice(["subprocess", "inprocess"]),
+    default="subprocess",
+    show_default=True,
+    help=(
+        "How resolve_library scans installed packages: 'subprocess' isolates "
+        "package imports in a disposable child process (crash isolation, "
+        "cross-venv scanning, no import-lock stalls); 'inprocess' imports "
+        "into the server process (for environments where spawning is "
+        "restricted)."
+    ),
+)
+@click.option(
+    "--scan-python",
+    type=str,
+    default=None,
+    help=(
+        "Python interpreter whose environment resolve_library scans "
+        "(default: the interpreter running the server). Lets the server "
+        "document packages installed in a different venv."
+    ),
+)
+@click.option(
+    "--scan-timeout",
+    type=float,
+    default=60.0,
+    show_default=True,
+    help="Seconds before a subprocess scan is killed.",
+)
 def serve_all(
     cache_dir: str | None,
     name: str,
@@ -336,6 +394,10 @@ def serve_all(
     registry: str | None,
     expose: tuple[str, ...],
     preload: tuple[str, ...],
+    max_response_bytes: int,
+    scan_mode: str,
+    scan_python: str | None,
+    scan_timeout: float,
 ):
     """Start a universal MCP server that resolves any installed Python library.
 
@@ -381,6 +443,10 @@ def serve_all(
             registry_url=registry,
             expose=list(expose) if expose else None,
             preload=list(preload) if preload else None,
+            max_response_bytes=max_response_bytes,
+            scan_mode=scan_mode,
+            scan_python=scan_python,
+            scan_timeout=scan_timeout,
         )
     except Exception as e:
         click.echo(f"Error: {e}", err=True)

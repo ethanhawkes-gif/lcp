@@ -21,6 +21,8 @@
 
 **lcp** (*Library Context Protocol*) is primarly a protocol designed to solve the problem of AI agents not having access to up-to-date library documentation, which leads to hallucinations and inaccurate code generation. The LCP SDK provides tools to scan Python packages, extract API information, and generate LCP-compliant JSON manifests. It also includes features for analyzing documentation coverage and generating missing docstrings using AI.
 
+> **On niche and post-cutoff Python libraries, the shipped LCP plugin lifts a small model's task success rate from 28% to 66% and halves its API-misuse rate — beating, on task success, an agent that reads the installed source.** Full reproducible methodology and per-run data: [Benchmark](https://zazza123.github.io/lcp/benchmark/).
+
 ## Installation
 
 ```bash
@@ -40,6 +42,19 @@ pip install lcp
 - AI-powered docstring generation via OpenAI and Anthropic (`lcp[ai]`)
 - Both CLI and Python API interfaces
 - MCP server for AI agent integration
+
+## When to choose LCP
+
+Choose LCP when your AI agent needs **exact, offline ground truth about the library versions installed in your environment** — including private packages that no documentation service has ever seen. Choose a service like Context7 when you want curated narrative documentation (tutorials, guides) for popular public libraries: LCP does not compete on prose, it competes on being *provably right about your environment*.
+
+|  | LCP | Context7 | llms.txt | Reading site-packages |
+|---|:---:|:---:|:---:|:---:|
+| Matches the *installed* version | yes | no | no | yes |
+| Works offline | yes | no | no | yes |
+| Private / internal packages | yes | no | no | yes |
+| Token-dense structured answers | yes | narrative text | coarse summary | raw source (expensive) |
+
+See the [full comparison](https://zazza123.github.io/lcp/introduction/#lcp-vs-alternatives) in the docs.
 
 ## Usage
 
@@ -160,11 +175,11 @@ The SDK includes an MCP (Model Context Protocol) server that exposes LCP manifes
 ### Starting the Server
 
 ```bash
-# Start MCP server for a library
-lcp serve requests.lcp.json
+# Universal server: resolves any installed library on demand
+lcp serve-all
 
-# With custom server name
-lcp serve numpy.lcp.json --name numpy-docs
+# Restrict and pre-warm specific libraries
+lcp serve-all --expose requests --preload requests
 ```
 
 ### MCP Client Configuration
@@ -174,9 +189,9 @@ Add to your MCP client configuration (e.g., Claude Desktop):
 ```json
 {
   "mcpServers": {
-    "requests-api": {
+    "lcp": {
       "command": "lcp",
-      "args": ["serve", "/path/to/requests.lcp.json"]
+      "args": ["serve-all"]
     }
   }
 }
@@ -186,23 +201,21 @@ Add to your MCP client configuration (e.g., Claude Desktop):
 
 | Tool | Description |
 |------|-------------|
-| `get_manifest` | Get library metadata (name, version, language) |
-| `list_modules` | List all modules in the library |
-| `list_symbols` | Browse symbols with optional filtering by module or kind |
-| `get_symbol` | Get full details for a specific symbol |
-| `search_symbols` | Find symbols by text search |
-| `get_class_members` | Get all methods and attributes of a class |
+| `resolve_library(name, version?)` | Load a library (cache → live scan → registry). Call first. |
+| `search(query, library?, module?, kind?, limit?)` | Ranked symbol search; empty query browses. Hits include the exact import line. |
+| `get_symbol(ids, library?)` | Batch detail: full signatures, parameters, import lines; classes inline member summaries. |
+| `get_overview(library?)` | Library identity plus the module tree with symbol counts. |
 
 ### Programmatic Usage
 
 ```python
-from lcp.mcp_server import create_server, run_server
+from lcp.mcp_server import create_universal_server
 
-# Create and customize server
-server = create_server("path/to/manifest.lcp.json", name="my-server")
+server = create_universal_server(name="my-server", preload=["requests"])
+server.run()  # serve on stdio
 
-# Or run directly
-run_server("path/to/manifest.lcp.json")
+# Or invoke tools in-process, without the MCP protocol
+server.tools["search"]("send get request", library="requests")
 ```
 
 ## AI Documentation Generation
@@ -301,12 +314,12 @@ For **local development** (when working on the plugin itself), load it directly 
 claude --plugin-dir /path/to/lcp/plugin/lcp
 ```
 
-### `.lcp.json` — per-project configuration
+### `.lcp-config.json` — per-project configuration
 
-The plugin uses a `.lcp.json` file to select the correct `lcp` launcher for each project. The `SessionStart` hook auto-generates this file when absent, seeding it from `settings.json` `pluginConfigs` values; edit the file directly thereafter.
+The plugin uses a `.lcp-config.json` file to select the correct `lcp` launcher for each project. The `SessionStart` hook auto-generates this file when absent, seeding it from `settings.json` `pluginConfigs` values; edit the file directly thereafter. Earlier versions named this file `.lcp.json`; the old name still works as a deprecated fallback — rename it to `.lcp-config.json`.
 
 **Locations** (first found wins):
-- `${CLAUDE_PROJECT_DIR}/.lcp.json` — per-project (safe to check in)
+- `${CLAUDE_PROJECT_DIR}/.lcp-config.json` — per-project (safe to check in)
 - `~/.lcp/config.json` — global fallback
 
 **Schema** (all fields optional):
@@ -321,16 +334,16 @@ The plugin uses a `.lcp.json` file to select the correct `lcp` launcher for each
 }
 ```
 
-`command` and `python` are mutually exclusive; `command` wins if both are set. `expose` and `preload` are `.lcp.json`-only fields (not in `userConfig`).
+`command` and `python` are mutually exclusive; `command` wins if both are set. `expose` and `preload` are `.lcp-config.json`-only fields (not in `userConfig`).
 
-To change an option: edit `.lcp.json` directly. To reset from `settings.json`, delete the file and restart the session — the hook regenerates it from `pluginConfigs.lcp@lcp.options`.
+To change an option: edit `.lcp-config.json` directly. To reset from `settings.json`, delete the file and restart the session — the hook regenerates it from `pluginConfigs.lcp@lcp.options`.
 
 ### Launcher resolution order
 
 The wrapper probes each candidate with `--version`; the first that succeeds wins:
 
-1. `.lcp.json` → `command`
-2. `.lcp.json` → `python` → `python -m lcp`
+1. `.lcp-config.json` → `command`
+2. `.lcp-config.json` → `python` → `python -m lcp`
 3. Auto-detected project venv under `${CLAUDE_PROJECT_DIR}`: `.venv/bin/lcp`, `.venv/bin/python -m lcp`, `venv/bin/lcp`, `venv/bin/python -m lcp`
 4. Active virtualenv via `$VIRTUAL_ENV`: `$VIRTUAL_ENV/bin/lcp`, `$VIRTUAL_ENV/bin/python -m lcp`
 5. `uv run --project <dir> --with lcp lcp` if `uv` is present (ephemeral; layers `lcp` onto the project env)

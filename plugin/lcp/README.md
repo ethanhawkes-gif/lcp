@@ -84,12 +84,11 @@ Once connected, Claude Code uses the `lcp-universal` skill to guide the agent. T
 User: "Set up FastAPI routes with proper dependency injection"
 
 Agent:
-  1. resolve_library("fastapi")                → scanned + cached
-  2. list_modules()                            → finds fastapi.routing
-  3. list_symbols(module="fastapi.routing")    → finds APIRouter, Depends
-  4. get_symbol("fastapi.routing:APIRouter")   → full signature
-  5. get_class_members("fastapi:Depends")      → understands dependencies
-  6. Writes accurate code
+  1. resolve_library("fastapi")                       → scanned + cached
+  2. search("routing dependency", library="fastapi")  → ranked hits + import lines
+  3. get_symbol(ids=["fastapi.routing:APIRouter",
+                     "fastapi:Depends"])              → full signatures, members inline
+  4. Writes accurate code
 ```
 
 ## Options
@@ -106,15 +105,16 @@ lcp serve-all --name my-lcp              # custom server name
 |-------|---------|
 | `lcp-universal` | Any task involving Python library usage — auto-loads via `resolve_library` |
 | `lcp-usage` | Detecting and using either the universal or a per-library LCP server |
-| `lcp-configure` | Setting up or repairing `.lcp.json` — when the MCP server won't start, libraries don't resolve, or you want to set a registry / expose / preload |
+| `lcp-configure` | Setting up or repairing `.lcp-config.json` — when the MCP server won't start, libraries don't resolve, or you want to set a registry / expose / preload |
 
-## Configuration (`.lcp.json`)
+## Configuration (`.lcp-config.json`)
 
 Most setups need no configuration — the plugin auto-detects a runnable `lcp` and
 uses the official registry. When it doesn't (e.g. `lcp` lives in a virtualenv off
 your `PATH`, you run a private registry, or you want to restrict/warm specific
-libraries), the server reads an optional `.lcp.json` (project root, falling back
-to `~/.lcp/config.json`):
+libraries), the server reads an optional `.lcp-config.json` (project root, falling back
+to `~/.lcp/config.json`); a legacy project `.lcp.json` is still read as a
+deprecated fallback):
 
 | Field | Effect |
 |-------|--------|
@@ -147,7 +147,7 @@ resolve_library("requests")
 LCPIndex (in-memory)
       │
       ▼
-list_symbols / get_symbol / get_class_members / ...
+search / get_symbol / get_overview
 ```
 
 ## Works with private packages

@@ -44,7 +44,13 @@ class ScannedSignature:
 
 @dataclass
 class ScannedSymbol:
-    """Scanned symbol information."""
+    """Scanned symbol information.
+
+    ``aliases`` holds ``(module_path, name)`` pairs where the symbol is
+    re-exported inside its own package (e.g. ``("requests", "get")`` for a
+    function defined in ``requests.api``); the definition site stays the
+    canonical identity.
+    """
 
     name: str
     qualified_name: str
@@ -52,10 +58,12 @@ class ScannedSymbol:
     kind: str  # function, class, method, attribute, constant, module
     summary: str | None = None
     description: str | None = None
+    docstring: str | None = None
     signature: ScannedSignature | None = None
     members: list[ScannedSymbol] = field(default_factory=list)
     source_file: str | None = None
     source_lines: tuple[int, int] | None = None
+    aliases: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -65,6 +73,182 @@ class ScannedModule:
     name: str
     version: str
     symbols: list[ScannedSymbol] = field(default_factory=list)
+
+
+class _ComplexDefault:
+    """Sentinel for a parameter default that is not a JSON primitive.
+
+    Round-trips ``ScannedParam.default`` across the subprocess boundary: it is
+    not ``inspect.Parameter.empty`` (so ``has_default`` stays ``True``) and not
+    a primitive, so the generator renders it as ``"..."`` — identical to how it
+    would render the original object.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<complex default>"
+
+
+_COMPLEX_DEFAULT = _ComplexDefault()
+_PRIMITIVE_DEFAULT_TYPES = (str, int, float, bool)
+
+
+def _default_to_dict(default: Any) -> dict:
+    """Encode a ``ScannedParam.default`` into a JSON-safe descriptor."""
+    if default is inspect.Parameter.empty:
+        return {"kind": "empty"}
+    if default is None or isinstance(default, _PRIMITIVE_DEFAULT_TYPES):
+        return {"kind": "primitive", "value": default}
+    return {"kind": "complex"}
+
+
+def _default_from_dict(d: dict) -> Any:
+    """Decode the descriptor produced by :func:`_default_to_dict`."""
+    kind = d.get("kind", "empty")
+    if kind == "primitive":
+        return d.get("value")
+    if kind == "complex":
+        return _COMPLEX_DEFAULT
+    return inspect.Parameter.empty
+
+
+def _param_to_dict(p: ScannedParam) -> dict:
+    return {
+        "name": p.name,
+        "type_hint": p.type_hint,
+        "default": _default_to_dict(p.default),
+        "kind": p.kind,
+        "description": p.description,
+    }
+
+
+def _param_from_dict(d: dict) -> ScannedParam:
+    return ScannedParam(
+        name=d["name"],
+        type_hint=d.get("type_hint"),
+        default=_default_from_dict(d.get("default", {})),
+        kind=d.get("kind", "positional"),
+        description=d.get("description"),
+    )
+
+
+def _signature_to_dict(s: ScannedSignature) -> dict:
+    return {
+        "params": [_param_to_dict(p) for p in s.params],
+        "return_type": s.return_type,
+        "is_async": s.is_async,
+        "raises": list(s.raises),
+    }
+
+
+def _signature_from_dict(d: dict) -> ScannedSignature:
+    return ScannedSignature(
+        params=[_param_from_dict(p) for p in d.get("params", [])],
+        return_type=d.get("return_type"),
+        is_async=d.get("is_async", False),
+        raises=list(d.get("raises", [])),
+    )
+
+
+def _symbol_to_dict(s: ScannedSymbol) -> dict:
+    return {
+        "name": s.name,
+        "qualified_name": s.qualified_name,
+        "module_path": s.module_path,
+        "kind": s.kind,
+        "summary": s.summary,
+        "description": s.description,
+        "docstring": s.docstring,
+        "signature": _signature_to_dict(s.signature) if s.signature else None,
+        "members": [_symbol_to_dict(m) for m in s.members],
+        "source_file": s.source_file,
+        "source_lines": list(s.source_lines) if s.source_lines else None,
+        "aliases": [list(a) for a in s.aliases],
+    }
+
+
+def _symbol_from_dict(d: dict) -> ScannedSymbol:
+    signature = d.get("signature")
+    source_lines = d.get("source_lines")
+    return ScannedSymbol(
+        name=d["name"],
+        qualified_name=d["qualified_name"],
+        module_path=d["module_path"],
+        kind=d["kind"],
+        summary=d.get("summary"),
+        description=d.get("description"),
+        docstring=d.get("docstring"),
+        signature=_signature_from_dict(signature) if signature else None,
+        members=[_symbol_from_dict(m) for m in d.get("members", [])],
+        source_file=d.get("source_file"),
+        source_lines=tuple(source_lines) if source_lines else None,
+        aliases=[tuple(a) for a in d.get("aliases", [])],
+    )
+
+
+def scanned_to_dict(module: ScannedModule) -> dict:
+    """Serialize a :class:`ScannedModule` tree into a JSON-safe dict.
+
+    Total by construction: complex parameter defaults degrade to a marker
+    rather than raising, so the child can always emit a document.
+    """
+    return {
+        "name": module.name,
+        "version": module.version,
+        "symbols": [_symbol_to_dict(s) for s in module.symbols],
+    }
+
+
+def scanned_from_dict(d: dict) -> ScannedModule:
+    """Rebuild a :class:`ScannedModule` tree from :func:`scanned_to_dict` output."""
+    return ScannedModule(
+        name=d["name"],
+        version=d["version"],
+        symbols=[_symbol_from_dict(s) for s in d.get("symbols", [])],
+    )
+
+
+@dataclass
+class _AliasRecord:
+    """A re-export observed while scanning, before its target is known.
+
+    ``scan_module`` records these when a member's ``__module__`` points at
+    another module inside the same package; ``_attach_aliases`` resolves
+    them onto the canonical scanned symbols once every module is scanned.
+    """
+
+    target_module: str
+    target_name: str
+    alias_module: str
+    alias_name: str
+
+
+def _attach_aliases(
+    symbols: list[ScannedSymbol], records: list[_AliasRecord]
+) -> None:
+    """Attach re-export aliases to their canonical scanned symbols.
+
+    Records whose target was never scanned (e.g. the defining module failed
+    to import, or the object is not a scannable kind) are dropped.
+    """
+    by_key = {(s.module_path, s.qualified_name): s for s in symbols}
+    for rec in records:
+        target = by_key.get((rec.target_module, rec.target_name))
+        if target is None:
+            continue
+        alias = (rec.alias_module, rec.alias_name)
+        if alias not in target.aliases:
+            target.aliases.append(alias)
+
+
+def _raw_docstring(doc: Any) -> str | None:
+    """Return *doc* when it is a plain string docstring, else ``None``.
+
+    Same non-string guard as ``_parse_docstring``: ``__doc__`` can be a
+    descriptor (e.g. sympy) and must never be parsed or stored as-is.
+    """
+    return doc if isinstance(doc, str) and doc else None
 
 
 def _parse_docstring(docstring: str | None) -> tuple[str | None, str | None]:
@@ -329,6 +513,7 @@ def _scan_class(
                     kind="method",
                     summary=member_summary,
                     description=member_desc,
+                    docstring=_raw_docstring(getattr(obj, "__doc__", None)),
                     signature=sig,
                 )
             )
@@ -342,6 +527,7 @@ def _scan_class(
                     kind="attribute",
                     summary=prop_summary,
                     description=prop_desc,
+                    docstring=_raw_docstring(obj.fget.__doc__ if obj.fget else None),
                 )
             )
 
@@ -352,6 +538,7 @@ def _scan_class(
         kind="class",
         summary=summary,
         description=description,
+        docstring=_raw_docstring(cls.__doc__),
         signature=init_sig,
         members=members,
         source_file=source_file,
@@ -375,6 +562,7 @@ def _scan_function(
         kind="function",
         summary=summary,
         description=description,
+        docstring=_raw_docstring(func.__doc__),
         signature=sig,
         source_file=source_file,
         source_lines=source_lines,
@@ -395,10 +583,13 @@ def scan_module(
     include_private: bool = False,
     _visited: set | None = None,
     _package_root: str | None = None,
+    _alias_records: list[_AliasRecord] | None = None,
 ) -> list[ScannedSymbol]:
     """Scan a module for symbols."""
     if _visited is None:
         _visited = set()
+
+    records = _alias_records if _alias_records is not None else []
 
     if _package_root is None:
         _package_root = module.__name__.split(".")[0]
@@ -421,6 +612,7 @@ def scan_module(
             kind="module",
             summary=mod_summary or f"Module {module_path}",
             description=mod_desc,
+            docstring=_raw_docstring(module.__doc__),
         )
     )
 
@@ -453,7 +645,24 @@ def scan_module(
             # Check if this symbol is defined in this module
             obj_module = getattr(obj, "__module__", None)
             if obj_module and obj_module != module_path:
-                # Skip re-exported symbols (documented in their origin module)
+                # Re-exported symbol: documented at its definition site.
+                # If the origin is inside the scanned package, record the
+                # re-export as an alias on the canonical symbol; external
+                # origins stay skipped entirely.
+                if isinstance(obj_module, str) and (
+                    obj_module == _package_root
+                    or obj_module.startswith(_package_root + ".")
+                ):
+                    target_name = getattr(obj, "__name__", None)
+                    if isinstance(target_name, str):
+                        records.append(
+                            _AliasRecord(
+                                target_module=obj_module,
+                                target_name=target_name,
+                                alias_module=module_path,
+                                alias_name=name,
+                            )
+                        )
                 continue
 
             if inspect.isclass(obj):
@@ -479,6 +688,9 @@ def scan_module(
         except Exception:
             continue
 
+    if _alias_records is None:
+        _attach_aliases(symbols, records)
+
     return symbols
 
 
@@ -490,8 +702,18 @@ def _get_package_version(package_name: str) -> str:
         return "0.0.0"
 
 
-def _iter_submodules(package: ModuleType) -> list[ModuleType]:
-    """Iterate over all submodules of a package, including namespace packages."""
+def _iter_submodules(
+    package: ModuleType, include_tests: bool = False
+) -> list[ModuleType]:
+    """Iterate over all submodules of a package, including namespace packages.
+
+    Args:
+        package: The imported package to walk.
+        include_tests: When ``False`` (default), subpackages whose leaf name is
+            exactly ``tests`` are skipped — they are not public API and pollute
+            manifests. Public utilities like ``numpy.testing`` (leaf
+            ``testing``) are always included.
+    """
     if not hasattr(package, "__path__"):
         return []
 
@@ -510,9 +732,15 @@ def _iter_submodules(package: ModuleType) -> list[ModuleType]:
         for module_info in pkgutil.iter_modules(
             current.__path__, prefix=current_name + "."
         ):
+            leaf = module_info.name.rpartition(".")[2]
             # ``__main__`` modules are entry-point scripts, never public API,
             # and importing them runs arbitrary CLI code (often ``sys.exit()``).
-            if module_info.name.rpartition(".")[2] == "__main__":
+            if leaf == "__main__":
+                continue
+            # Test subpackages are not public API and pollute manifests; their
+            # modules also frequently call ``pytest.importorskip`` at import,
+            # raising ``Skipped`` (a ``BaseException``). Skip before importing.
+            if not include_tests and leaf == "tests":
                 continue
             try:
                 submod = importlib.import_module(module_info.name)
@@ -522,8 +750,10 @@ def _iter_submodules(package: ModuleType) -> list[ModuleType]:
                 # Skip modules that terminate at import time (for example CLI-style
                 # modules that call ``sys.exit()``).
                 continue
-            except Exception:
-                # Skip modules that fail to import with regular exceptions.
+            except BaseException:
+                # Skip modules that fail to import with any exception, including
+                # ``BaseException`` subclasses such as ``pytest.Skipped`` raised
+                # by ``importorskip`` in test modules.
                 continue
 
             if submod.__name__ in discovered:
@@ -546,6 +776,7 @@ def _iter_submodules(package: ModuleType) -> list[ModuleType]:
                     or child.name == "__pycache__"
                     or not child.name.isidentifier()
                     or (child / "__init__.py").exists()
+                    or (not include_tests and child.name == "tests")
                 ):
                     continue
 
@@ -559,7 +790,7 @@ def _iter_submodules(package: ModuleType) -> list[ModuleType]:
                     raise
                 except SystemExit:
                     continue
-                except Exception:
+                except BaseException:
                     continue
 
                 discovered.add(namespace_mod.__name__)
@@ -571,9 +802,21 @@ def _iter_submodules(package: ModuleType) -> list[ModuleType]:
 
 
 def scan_package(
-    package_name: str, include_private: bool = False, recursive: bool = True
+    package_name: str,
+    include_private: bool = False,
+    recursive: bool = True,
+    include_tests: bool = False,
 ) -> ScannedModule:
-    """Scan an installed package and return scanned information."""
+    """Scan an installed package and return scanned information.
+
+    Args:
+        package_name: Import path of the package to scan.
+        include_private: Include private symbols (names starting with ``_``).
+        recursive: Walk submodules recursively.
+        include_tests: When ``False`` (default), skip ``*.tests`` subpackages —
+            they are not public API and pollute manifests. Public utilities like
+            ``numpy.testing`` are always included.
+    """
     try:
         module = importlib.import_module(package_name)
     except ImportError as e:
@@ -582,15 +825,29 @@ def scan_package(
     version = _get_package_version(package_name)
     visited: set = set()
     package_root = package_name.split(".")[0]
+    alias_records: list[_AliasRecord] = []
 
     # Scan main module
-    symbols = scan_module(module, include_private, visited, _package_root=package_root)
+    symbols = scan_module(
+        module,
+        include_private,
+        visited,
+        _package_root=package_root,
+        _alias_records=alias_records,
+    )
 
     # Scan submodules if it's a package
     if recursive and hasattr(module, "__path__"):
-        for submod in _iter_submodules(module):
+        for submod in _iter_submodules(module, include_tests=include_tests):
             symbols.extend(
-                scan_module(submod, include_private, visited, _package_root=package_root)
+                scan_module(
+                    submod,
+                    include_private,
+                    visited,
+                    _package_root=package_root,
+                    _alias_records=alias_records,
+                )
             )
 
+    _attach_aliases(symbols, alias_records)
     return ScannedModule(name=package_name, version=version, symbols=symbols)
