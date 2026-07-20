@@ -377,6 +377,7 @@ class TestResolveDocumentVersion:
             version=cached_version,
             scan_mode="inprocess",
         )
+        got = got.document
         assert source == "cache"
         assert got.manifest.library.version == cached_version
 
@@ -557,6 +558,7 @@ class TestResolveLibraryDocument:
             no_cache=True,
             scan_mode="inprocess",
         )
+        doc = doc.document
         assert doc is not None
         assert source == "scan"
         assert len(doc.symbols) > 0
@@ -571,6 +573,7 @@ class TestResolveLibraryDocument:
             no_cache=False,
             scan_mode="inprocess",
         )
+        doc1 = doc1.document
         assert source1 == "scan"
         # Cache directory should exist
         assert cache_dir.exists()
@@ -582,6 +585,7 @@ class TestResolveLibraryDocument:
             no_cache=False,
             scan_mode="inprocess",
         )
+        doc2 = doc2.document
         assert source2 == "cache"
         assert len(doc2.symbols) == len(doc1.symbols)
 
@@ -634,12 +638,11 @@ class TestResolveLibraryDocument:
             )
 
         assert source == "registry"
-        assert result_doc is not None
 
     def test_registry_not_used_when_scan_succeeds(self, tmp_path: Path):
         """Should not contact registry when local scan succeeds."""
         with patch("urllib.request.urlopen") as mock_urlopen:
-            doc, source = resolve_library_document(
+            result, source = resolve_library_document(
                 "tests.sample_module",
                 cache_dir=tmp_path / "cache",
                 no_cache=True,
@@ -700,6 +703,38 @@ class TestResolveLibraryDocument:
 
         assert source == "registry"
         assert cache_dir.exists()
+
+
+class TestResolveReportsUnresolved:
+    """An agent resolving a facade must be told where the surface lives."""
+
+    def test_resolve_document_carries_unresolved(self, tmp_path):
+        from lcp.mcp_server import resolve_library_document
+
+        result, source = resolve_library_document(
+            "sample_package.convenience",
+            cache_dir=tmp_path,
+            no_cache=True,
+            scan_mode="inprocess",
+        )
+
+        assert source == "scan"
+        assert result.unresolved_reexports == [("sample_package.core", 2, 1)]
+
+    def test_cache_and_registry_hits_carry_nothing(self, tmp_path):
+        """Only a live scan can produce the diagnostic."""
+        from lcp.mcp_server import resolve_library_document
+
+        first, _ = resolve_library_document(
+            "sample_package.convenience", cache_dir=tmp_path, scan_mode="inprocess"
+        )
+        assert first.unresolved_reexports == [("sample_package.core", 2, 1)]
+
+        second, source = resolve_library_document(
+            "sample_package.convenience", cache_dir=tmp_path, scan_mode="inprocess"
+        )
+        assert source == "cache"
+        assert second.unresolved_reexports == []
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1116,84 @@ class TestResolveLibraryTool:
         result = server.tools["resolve_library"](name="tests.sample_module")
         assert result["source"] == "cache"
         assert "version_mismatch" not in result
+
+    def test_note_names_origin_when_reexports_are_unresolved(self, tmp_path):
+        """A facade scan attaches a note naming the unscanned origin (#58)."""
+        server = create_universal_server(
+            cache_dir=tmp_path / "cache", no_cache=True, scan_mode="inprocess"
+        )
+        result = server.tools["resolve_library"](name="sample_package.convenience")
+
+        assert result["status"] == "loaded"
+        assert "note" in result
+        assert "sample_package.core" in result["note"]
+        assert "2 public names" in result["note"]
+        assert "defined in sample_package.core" in result["note"]
+        assert "resolve_library('sample_package.core')" in result["note"]
+
+    def test_note_flags_additional_origins_when_more_than_one(
+        self, tmp_path, monkeypatch, sample_lcp_file
+    ):
+        """The note must not silently drop origins beyond the first (FIX 2)."""
+        from lcp.subprocess_scan import ScanResult
+
+        doc = load_lcp_document(sample_lcp_file)
+        fake_result = ScanResult(
+            document=doc,
+            unresolved_reexports=[("pkg.core", 3, 1), ("pkg.extras", 1, 1)],
+        )
+        monkeypatch.setattr(
+            "lcp.mcp_server.resolve_library_document",
+            lambda *a, **k: (fake_result, "scan"),
+        )
+
+        server = create_universal_server(cache_dir=tmp_path / "cache", no_cache=True)
+        result = server.tools["resolve_library"](name="tests.sample_module")
+
+        assert "note" in result
+        assert "pkg.core" in result["note"]
+        assert "3 public names" in result["note"]
+        # The other origins are now named so the agent can act on them.
+        assert "pkg.extras" in result["note"]
+        # Distinct names, not the same ones restated at a second location.
+        assert "Further names come from" in result["note"]
+        # The tail must not promise full surface when other origins exist.
+        assert "for the full surface" not in result["note"]
+        assert "to recover that surface" in result["note"]
+
+    def test_note_uses_under_wording_when_ancestor_spans_several_modules(
+        self, tmp_path, monkeypatch, sample_lcp_file
+    ):
+        """A collapsed ancestor with several contributing modules reads "under"."""
+        from lcp.subprocess_scan import ScanResult
+
+        doc = load_lcp_document(sample_lcp_file)
+        fake_result = ScanResult(
+            document=doc,
+            unresolved_reexports=[("google.cloud.firestore_v1", 55, 26)],
+        )
+        monkeypatch.setattr(
+            "lcp.mcp_server.resolve_library_document",
+            lambda *a, **k: (fake_result, "scan"),
+        )
+
+        server = create_universal_server(cache_dir=tmp_path / "cache", no_cache=True)
+        result = server.tools["resolve_library"](name="tests.sample_module")
+
+        assert "note" in result
+        assert (
+            "defined under google.cloud.firestore_v1 (26 modules)" in result["note"]
+        )
+        # Single ancestor: the tail still promises the full surface.
+        assert "for the full surface" in result["note"]
+        assert "to recover that surface" not in result["note"]
+
+    def test_note_absent_when_no_reexports_are_unresolved(self, universal_server):
+        """The happy path (no lost surface) must not carry a note at all."""
+        result = universal_server.tools["resolve_library"](
+            name="tests.sample_module"
+        )
+        assert "note" not in result
 
 
 class TestLibraryDisambiguation:

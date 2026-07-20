@@ -90,7 +90,7 @@ class TestScanPackageSubprocess:
     def test_happy_path_returns_document(self):
         doc = scan_package_subprocess(
             "sample_package", extra_paths=[str(TESTS_DIR)]
-        )
+        ).document
         assert doc.manifest.library.name == "sample_package"
         assert len(doc.symbols) > 0
 
@@ -168,7 +168,7 @@ class TestCrossEnvironmentScan:
     def test_scan_resolves_package_from_second_venv(self, second_venv):
         doc = scan_package_subprocess(
             "secondvenv_only_pkg", python=str(second_venv)
-        )
+        ).document
         assert "secondvenv_only_pkg:greet" in doc.symbols
 
 
@@ -181,6 +181,7 @@ class TestResolveViaSubprocess:
         monkeypatch.chdir(TESTS_DIR)  # child inherits cwd → fixtures importable
         cache_dir = tmp_path / "cache"
         doc, source = resolve_library_document("sample_package", cache_dir=cache_dir)
+        doc = doc.document
         assert source == "scan"
         assert len(doc.symbols) > 0
         _, source2 = resolve_library_document("sample_package", cache_dir=cache_dir)
@@ -203,6 +204,7 @@ class TestResolveViaSubprocess:
             no_cache=True,
             scan_python=str(second_venv),
         )
+        doc = doc.document
         assert source == "scan"
         assert "secondvenv_only_pkg:greet" in doc.symbols
 
@@ -227,6 +229,7 @@ class TestResolveViaSubprocess:
             no_cache=True,
             scan_mode="inprocess",
         )
+        doc = doc.document
         assert source == "scan"
         assert len(doc.symbols) > 0
 
@@ -237,7 +240,7 @@ class TestResolveViaSubprocess:
             raise ScanSpawnError("spawn blocked")
 
         monkeypatch.setattr("lcp.mcp_server.scan_package_subprocess", blocked)
-        doc, source = resolve_library_document(
+        result, source = resolve_library_document(
             "tests.sample_module", cache_dir=tmp_path, no_cache=True
         )
         assert source == "scan"  # fell back to in-process, same environment
@@ -325,6 +328,7 @@ class TestConcurrency:
                 cache_dir=tmp_path / "quick-cache",
                 no_cache=True,
             )
+            doc = doc.document
             assert len(doc.symbols) > 0
             assert not slow_done.is_set(), (
                 "quick resolve should complete while the slow scan is running"
@@ -393,7 +397,21 @@ class TestHostLeakIsolation:
 
         doc = scan_package_subprocess(
             "contam_pkg", python=bare_target_venv, extra_paths=[str(tmp_path)]
-        )
+        ).document
 
         assert "contam_pkg:core" in doc.symbols
         assert not any(sid.startswith("contam_pkg.opt") for sid in doc.symbols)
+
+
+class TestUnresolvedReexportsPropagate:
+    """The diagnostic must survive the child-to-host JSON hop."""
+
+    def test_subprocess_scan_reports_unresolved(self):
+        from lcp.subprocess_scan import scan_package_subprocess
+
+        result = scan_package_subprocess(
+            "sample_package.convenience", extra_paths=[str(TESTS_DIR)]
+        )
+
+        assert result.unresolved_reexports == [("sample_package.core", 2, 1)]
+        assert result.document.manifest.library.name == "sample_package.convenience"
