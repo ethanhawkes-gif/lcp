@@ -6,6 +6,7 @@ import importlib
 import importlib.metadata
 import inspect
 import pkgutil
+import re
 import sys
 import typing
 from dataclasses import dataclass, field
@@ -729,6 +730,148 @@ def _is_constant(name: str, value: Any) -> bool:
     return top_level not in sys.stdlib_module_names
 
 
+def _normalize_dist(name: str) -> str:
+    """Normalise a distribution or top-level name for comparison.
+
+    Collapses runs of ``-``, ``_`` and ``.`` to a single ``-`` and lowercases,
+    so ``Fake_Dep.Name`` and ``fake-dep-name`` compare equal (PEP 503-style).
+
+    Args:
+        name: A distribution or import name.
+
+    Returns:
+        The normalised form.
+    """
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _followable_top_levels(package_root: str) -> frozenset[str]:
+    """Top-level import names provided by ``package_root``'s declared deps.
+
+    Resolves ``package_root`` to its distribution(s), reads their declared
+    dependencies, and returns the set of top-level import names those
+    dependency distributions provide. A foreign re-export whose origin
+    top-level is in this set comes from a declared dependency and may be
+    followed (facade support, #67). Any failure yields an empty set, which
+    disables following rather than raising.
+
+    Args:
+        package_root: First dotted segment of the scanned package's import path.
+
+    Returns:
+        The followable top-level import names, or an empty set.
+    """
+    try:
+        pkg_dists = importlib.metadata.packages_distributions()
+    except Exception:
+        return frozenset()
+    dists = pkg_dists.get(package_root, [])
+    if not dists:
+        return frozenset()
+    declared: set[str] = set()
+    for dist in dists:
+        try:
+            reqs = importlib.metadata.requires(dist) or []
+        except Exception:
+            reqs = []
+        for req in reqs:
+            dep = re.split(r"[ ;<>=!~\[\(]", req.strip())[0]
+            if dep:
+                declared.add(_normalize_dist(dep))
+    if not declared:
+        return frozenset()
+    return frozenset(
+        top
+        for top, tops_dists in pkg_dists.items()
+        if any(_normalize_dist(d) in declared for d in tops_dists)
+    )
+
+
+def _is_followable_reexport(
+    obj_module: str, followable_tops: frozenset[str] | None
+) -> bool:
+    """Whether a foreign re-export defined in ``obj_module`` should be followed.
+
+    Args:
+        obj_module: The ``__module__`` of the re-exported object.
+        followable_tops: Top-levels provided by declared deps, or ``None`` when
+            the feature is inert.
+
+    Returns:
+        ``True`` when the origin is a declared, non-stdlib dependency.
+    """
+    if not followable_tops:
+        return False
+    top = obj_module.split(".")[0]
+    if top in sys.stdlib_module_names:
+        return False
+    return top in followable_tops
+
+
+def _reexport_kind(name: str, obj: Any) -> str:
+    """Classify a followed foreign re-export.
+
+    Returns ``"class"``, ``"function"``, ``"value"`` or ``"defer"``. ``"defer"``
+    marks a callable with a recoverable signature — it looks like a
+    C-implemented function and is left for #63 rather than mislabelled a
+    constant here. A callable whose ``signature()`` raises (e.g. a proxy read
+    outside its context) is a value object, not a function.
+
+    Args:
+        name: Attribute name the object is bound to at the facade.
+        obj: The re-exported object.
+
+    Returns:
+        The classification tag.
+    """
+    if inspect.isclass(obj):
+        return "class"
+    if inspect.isfunction(obj):
+        return "function"
+    if _is_constant(name, obj):
+        return "value"
+    try:
+        inspect.signature(obj)
+    except Exception:
+        return "value"
+    return "defer"
+
+
+def _capture_reexport(
+    name: str, obj: Any, module_path: str, include_private: bool
+) -> ScannedSymbol | None:
+    """Capture a followed foreign re-export as a symbol at ``module_path``.
+
+    A re-exported class is scanned with its *origin* top-level as the package
+    root, so its own methods are kept rather than filtered out by the facade's
+    root. A deferred callable (see :func:`_reexport_kind`) yields ``None``.
+
+    Args:
+        name: Attribute name at the facade.
+        obj: The re-exported object.
+        module_path: The facade module the symbol is attributed to.
+        include_private: Whether to include private members (classes).
+
+    Returns:
+        The captured symbol, or ``None`` when deferred to #63.
+    """
+    kind = _reexport_kind(name, obj)
+    if kind == "class":
+        origin_root = str(getattr(obj, "__module__", "") or "").split(".")[0]
+        return _scan_class(obj, module_path, include_private, package_root=origin_root)
+    if kind == "function":
+        return _scan_function(obj, module_path, name)
+    if kind == "value":
+        return ScannedSymbol(
+            name=name,
+            qualified_name=name,
+            module_path=module_path,
+            kind="constant",
+            summary=_constant_summary(obj),
+        )
+    return None
+
+
 _MAX_CONSTANT_REPR = 60
 
 
@@ -772,6 +915,7 @@ def scan_module(
     _visited: set | None = None,
     _package_root: str | None = None,
     _alias_records: list[_AliasRecord] | None = None,
+    _followable_tops: frozenset[str] | None = None,
 ) -> list[ScannedSymbol]:
     """Scan a module for symbols."""
     if _visited is None:
@@ -833,24 +977,32 @@ def scan_module(
             # Check if this symbol is defined in this module
             obj_module = getattr(obj, "__module__", None)
             if obj_module and obj_module != module_path:
-                # Re-exported symbol: documented at its definition site.
-                # If the origin is inside the scanned package, record the
-                # re-export as an alias on the canonical symbol; external
-                # origins stay skipped entirely.
-                if isinstance(obj_module, str) and (
-                    obj_module == _package_root
-                    or obj_module.startswith(_package_root + ".")
-                ):
-                    target_name = getattr(obj, "__name__", None)
-                    if isinstance(target_name, str):
-                        records.append(
-                            _AliasRecord(
-                                target_module=obj_module,
-                                target_name=target_name,
-                                alias_module=module_path,
-                                alias_name=name,
+                # Re-exported symbol, documented at its definition site.
+                if isinstance(obj_module, str):
+                    if obj_module == _package_root or obj_module.startswith(
+                        _package_root + "."
+                    ):
+                        # In-package origin: record the re-export as an alias
+                        # on the canonical symbol.
+                        target_name = getattr(obj, "__name__", None)
+                        if isinstance(target_name, str):
+                            records.append(
+                                _AliasRecord(
+                                    target_module=obj_module,
+                                    target_name=target_name,
+                                    alias_module=module_path,
+                                    alias_name=name,
+                                )
                             )
+                    elif _is_followable_reexport(obj_module, _followable_tops):
+                        # Foreign origin in a declared dependency: capture the
+                        # object at the facade (#67). The foreign package is
+                        # not scanned.
+                        captured = _capture_reexport(
+                            name, obj, module_path, include_private
                         )
+                        if captured is not None:
+                            symbols.append(captured)
                 continue
 
             if inspect.isclass(obj):
@@ -1013,6 +1165,7 @@ def scan_package(
     version = _get_package_version(package_name)
     visited: set = set()
     package_root = package_name.split(".")[0]
+    followable_tops = _followable_top_levels(package_root)
     alias_records: list[_AliasRecord] = []
 
     # Scan main module
@@ -1022,6 +1175,7 @@ def scan_package(
         visited,
         _package_root=package_root,
         _alias_records=alias_records,
+        _followable_tops=followable_tops,
     )
 
     # Scan submodules if it's a package
@@ -1034,6 +1188,10 @@ def scan_package(
                     visited,
                     _package_root=package_root,
                     _alias_records=alias_records,
+                    # Facade capture is scoped to the entry module: a package's
+                    # public re-export surface is the module the user scans, not
+                    # its internal submodules. See #67.
+                    _followable_tops=None,
                 )
             )
 
