@@ -6,6 +6,7 @@ import importlib
 import importlib.metadata
 import inspect
 import pkgutil
+import sys
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -649,13 +650,120 @@ def _scan_function(
     )
 
 
-def _is_constant(name: str, value: Any) -> bool:
-    """Check if a value looks like a constant."""
-    # Constants are typically UPPER_CASE
-    if not name.isupper():
+_PRIMITIVE_TYPES = (int, float, str, bytes, bool, type(None), tuple, frozenset)
+
+
+def _is_primitive(value: Any) -> bool:
+    """Whether *value* is a primitive, without trusting the object.
+
+    ``isinstance`` is not safe here. When its fast ``type()`` check misses it
+    falls back to reading ``value.__class__``, and that read goes through a
+    hostile ``__getattribute__``: an ``AttributeError`` is swallowed, but a
+    proxy raising anything else propagates out of what reads like a pure
+    predicate. The identity check settles the common case without touching
+    the object at all; the guarded fallback preserves subclass semantics,
+    which a bare ``type(value) in`` check would lose.
+
+    A proxy like ``flask.request`` never actually reaches this function
+    through ``scan_module``: the member loop's own
+    ``getattr(obj, "__module__", None)`` raises first and the member is
+    dropped before classification is attempted. Reaching this guarded
+    fallback at all is only possible for objects that survive that earlier
+    step; it remains as defence-in-depth for callers that classify a value
+    directly (as some tests do) or for a future member-loop shape that
+    reaches classification sooner.
+
+    Args:
+        value: The object to classify.
+
+    Returns:
+        ``True`` when *value* is one of the primitive types.
+    """
+    if type(value) in _PRIMITIVE_TYPES:
+        return True
+    try:
+        return isinstance(value, _PRIMITIVE_TYPES)
+    except Exception:
         return False
-    # Must be a simple type
-    return isinstance(value, (int, float, str, bytes, bool, type(None), tuple, frozenset))
+
+
+def _is_constant(name: str, value: Any) -> bool:
+    """Decide whether *value* should be recorded as a public constant.
+
+    Three cases, in order:
+
+    * a primitive value is admitted only under an ``UPPER_CASE`` name — the
+      historical rule, unchanged;
+    * a callable under a non-``UPPER_CASE`` name is rejected;
+    * anything else is admitted when its *type* is defined outside the
+      standard library.
+
+    That asymmetry on case is what keeps C-implemented functions out.
+    Libraries written partly in C ship their functions as instances of a
+    library-defined callable type — ``numpy.add`` is a ``ufunc``,
+    ``numpy.mean`` an ``_ArrayFunctionDispatcher`` — and those are
+    structurally indistinguishable from a legitimate value object such as
+    ``click.INT``: ``inspect.isroutine``, the descriptor protocol,
+    ``__code__`` and ``__wrapped__`` all fail to separate them. Python's
+    naming convention separates what structure cannot. Scanning those
+    functions properly is issue #63.
+
+    Only ``type(value)`` is consulted, never the instance's own attributes.
+    Attribute access on the value itself is unsafe: a proxy forwards it and
+    can raise (``flask.request`` raises ``RuntimeError`` outside a request
+    context). Primitive detection goes through ``_is_primitive`` rather than
+    a bare ``isinstance`` call for the same reason.
+
+    Args:
+        name: Attribute name the object is bound to in its module.
+        value: The object bound to that name.
+
+    Returns:
+        ``True`` when the symbol should be recorded as a constant.
+    """
+    if _is_primitive(value):
+        return name.isupper()
+    if callable(value) and not name.isupper():
+        return False
+    top_level = str(type(value).__module__ or "").split(".")[0]
+    return top_level not in sys.stdlib_module_names
+
+
+_MAX_CONSTANT_REPR = 60
+
+
+def _constant_summary(value: Any) -> str:
+    """Build the summary line for a constant symbol.
+
+    Primitives carry their value; everything else carries only its type name.
+    The value is deliberately withheld for non-primitives: ``__repr__`` on an
+    arbitrary object can be enormous, expensive, or raise. Primitive
+    detection goes through ``_is_primitive`` rather than a bare
+    ``isinstance`` call, which is not safe on a hostile object.
+
+    Two of the primitive types, ``tuple`` and ``frozenset``, are containers
+    that can hold arbitrary objects, and ``str``/``bytes`` can be subclassed
+    with an overridden ``__repr__``. So even a primitive's own ``repr()``
+    call is not guaranteed safe: if it raises, the summary degrades to the
+    type-only form rather than letting the exception escape (which would
+    otherwise drop the whole symbol from the scan).
+
+    Args:
+        value: The object bound to the constant's name.
+
+    Returns:
+        e.g. ``"int constant: 100"`` or ``"Sentinel constant."``.
+    """
+    type_name = type(value).__name__
+    if not _is_primitive(value):
+        return f"{type_name} constant."
+    try:
+        rendered = repr(value)
+    except Exception:
+        return f"{type_name} constant."
+    if len(rendered) > _MAX_CONSTANT_REPR:
+        rendered = rendered[:_MAX_CONSTANT_REPR] + "…"
+    return f"{type_name} constant: {rendered}"
 
 
 def scan_module(
@@ -760,7 +868,7 @@ def scan_module(
                         qualified_name=name,
                         module_path=module_path,
                         kind="constant",
-                        summary=f"Constant {name}",
+                        summary=_constant_summary(obj),
                     )
                 )
         except KeyboardInterrupt:

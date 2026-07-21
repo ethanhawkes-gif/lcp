@@ -3,6 +3,7 @@
 import inspect
 
 import pytest
+from hostile_objects import Hostile, HostileProxy
 
 from lcp.scanner import (
     ScannedModule,
@@ -133,6 +134,111 @@ class TestIsConstant:
     def test_complex_values_not_constant(self):
         assert _is_constant("MY_LIST", [1, 2, 3]) is False
         assert _is_constant("MY_DICT", {"a": 1}) is False
+
+    def test_library_sentinel_is_constant(self):
+        """A non-primitive instance of a library type is admitted."""
+        from lcp.scanner import _is_constant
+
+        class Sentinel:
+            pass
+
+        assert _is_constant("SERVER_TIMESTAMP", Sentinel()) is True
+
+    def test_lowercase_non_callable_instance_is_constant(self):
+        """The UPPER_CASE requirement is dropped for non-callables."""
+        from lcp.scanner import _is_constant
+
+        class Missing:
+            pass
+
+        assert _is_constant("missing", Missing()) is True
+
+    def test_lowercase_callable_instance_is_not_constant(self):
+        """Callables must still be UPPER_CASE: this is how C functions stay out."""
+        from lcp.scanner import _is_constant
+
+        class Dispatcher:
+            def __call__(self):
+                return None
+
+        assert _is_constant("mean", Dispatcher()) is False
+
+    def test_uppercase_callable_instance_is_constant(self):
+        """click.INT is callable but is a value, and its name says so."""
+        from lcp.scanner import _is_constant
+
+        class IntParamType:
+            def __call__(self):
+                return None
+
+        assert _is_constant("INT", IntParamType()) is True
+
+    def test_stdlib_typed_object_is_not_constant(self):
+        """`annotations` leaked by __future__ must not become a symbol."""
+        import __future__
+
+        from lcp.scanner import _is_constant
+
+        # NOTE: `from __future__ import annotations` is a compiler directive
+        # and is a SyntaxError anywhere but the top of a module — import the
+        # module and read the attribute instead. Its type `_Feature` lives in
+        # `__future__`, which is in sys.stdlib_module_names, so it is rejected.
+        assert _is_constant("annotations", __future__.annotations) is False
+
+    def test_type_without_module_does_not_raise(self):
+        """__module__ can be None on exotic types; .split() must not explode."""
+        from lcp.scanner import _is_constant
+
+        class Odd:
+            pass
+
+        Odd.__module__ = None
+        assert _is_constant("ODD", Odd()) is True
+
+    def test_type_with_non_string_module_does_not_raise(self):
+        """__module__ is settable to any object; .split() must not explode.
+
+        A non-string is not merely None: without an explicit str() wrap it
+        has no .split() method at all, so the AttributeError would propagate
+        and drop the symbol via scan_module's broad except.
+        """
+        from lcp.scanner import _is_constant
+
+        class Weird:
+            pass
+
+        Weird.__module__ = object()  # non-string, non-None
+        assert _is_constant("WEIRD", Weird()) is True
+
+    def test_hostile_object_is_classified_without_touching_attributes(self):
+        """Proxies raise on attribute access; only type(obj) is safe."""
+        from lcp.scanner import _is_constant
+
+        assert _is_constant("PROXY", Hostile()) is True
+
+    def test_hostile_getattribute_runtime_error_is_classified_without_raising(self):
+        """isinstance()'s __class__ fallback must not let a proxy's exception escape.
+
+        flask.request raises RuntimeError (not AttributeError) outside a
+        request context. A bare ``isinstance(value, _PRIMITIVE_TYPES)`` call
+        would let that propagate out of what reads like a pure predicate;
+        the object must still be classified (and admitted) without raising.
+        """
+        from lcp.scanner import _is_constant
+
+        assert _is_constant("proxy", HostileProxy()) is True
+
+    def test_str_subclass_is_still_a_primitive(self):
+        """Subclass semantics must survive the safety fix: MyStr is a str here."""
+        from lcp.scanner import _is_constant
+
+        class MyStr(str):
+            pass
+
+        # Primitive branch applies (UPPER_CASE required) rather than the
+        # "non-stdlib type" branch (which would admit any name).
+        assert _is_constant("MY_CONST", MyStr("x")) is True
+        assert _is_constant("my_const", MyStr("x")) is False
 
 
 class TestGetParamKind:
@@ -1035,3 +1141,56 @@ class TestUnresolvedReexports:
         restored = scanned_from_dict({"name": "x", "version": "1.0", "symbols": []})
 
         assert restored.unresolved_reexports == []
+
+
+class TestConstantSummary:
+    """A constant symbol must say what it is, and what it holds when simple."""
+
+    def test_primitive_carries_its_value(self):
+        from lcp.scanner import _constant_summary
+
+        assert _constant_summary(100) == "int constant: 100"
+        assert _constant_summary("lcp") == "str constant: 'lcp'"
+
+    def test_object_carries_its_type_only(self):
+        from lcp.scanner import _constant_summary
+
+        class Sentinel:
+            pass
+
+        assert _constant_summary(Sentinel()) == "Sentinel constant."
+
+    def test_long_primitive_repr_is_truncated(self):
+        from lcp.scanner import _constant_summary
+
+        summary = _constant_summary("x" * 200)
+
+        assert summary.startswith("str constant: ")
+        assert summary.endswith("…")
+        assert len(summary) < 100
+
+    def test_summary_reaches_the_scanned_symbol(self):
+        """The call site must use the helper, not the old literal."""
+        from lcp.scanner import scan_package
+
+        scanned = scan_package("sample_module", recursive=False)
+        by_name = {s.name: s for s in scanned.symbols}
+
+        assert by_name["MAX_ITEMS"].summary == "int constant: 100"
+        assert by_name["MODULE_VERSION"].summary == "str constant: '1.0.0'"
+
+    def test_hostile_getattribute_runtime_error_summary_does_not_raise(self):
+        """A proxy's RuntimeError must not propagate out of the summary builder."""
+        from lcp.scanner import _constant_summary
+
+        assert _constant_summary(HostileProxy()) == "HostileProxy constant."
+
+    def test_str_subclass_renders_its_value(self):
+        """Subclass semantics must survive: the summary still renders the value."""
+        from lcp.scanner import _constant_summary
+
+        class MyStr(str):
+            pass
+
+        value = MyStr("hello")
+        assert _constant_summary(value) == f"MyStr constant: {value!r}"
