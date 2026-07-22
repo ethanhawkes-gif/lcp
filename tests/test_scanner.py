@@ -1,6 +1,7 @@
 """Tests for the scanner module."""
 
 import inspect
+import types
 
 import pytest
 from hostile_objects import Hostile, HostileProxy
@@ -9,6 +10,7 @@ from lcp.scanner import (
     ScannedModule,
     ScannedParam,
     _get_param_kind,
+    _is_c_function,
     _is_constant,
     _is_member_from_package,
     _is_public,
@@ -241,6 +243,58 @@ class TestIsConstant:
         assert _is_constant("my_const", MyStr("x")) is False
 
 
+class TestIsCFunction:
+    """Tests for _is_c_function — the #63 C-function predicate."""
+
+    def test_library_typed_lowercase_callable_is_function(self):
+        """A lowercase callable of a library type with a signature is admitted."""
+
+        class Ufunc:
+            __module__ = "fakelib.core"
+
+            def __call__(self, x, y):
+                return x + y
+
+        assert _is_c_function("add", Ufunc()) is True
+
+    def test_uppercase_name_is_not_function(self):
+        """UPPER_CASE is a constant, not a function (mirror of #61)."""
+
+        class Sentinel:
+            __module__ = "fakelib.core"
+
+            def __call__(self, *args, **kwargs):
+                return None
+
+        assert _is_c_function("INT", Sentinel()) is False
+
+    def test_non_callable_is_not_function(self):
+        class Value:
+            __module__ = "fakelib.core"
+
+        assert _is_c_function("thing", Value()) is False
+
+    def test_stdlib_typed_callable_is_not_function(self):
+        """A re-bound builtin / functools.partial is not a library function."""
+        import functools
+
+        assert _is_c_function("wrapped", functools.partial(len)) is False
+
+    def test_signature_less_callable_is_not_function(self):
+        """A callable whose signature cannot be recovered is a value object."""
+
+        class NoSig:
+            __module__ = "fakelib.core"
+            # __call__ present (so callable() is True) but signature() raises
+            __call__ = property(
+                lambda self: (_ for _ in ()).throw(ValueError("no signature"))
+            )
+
+        obj = NoSig()
+        assert callable(obj) is True
+        assert _is_c_function("mystery", obj) is False
+
+
 class TestGetParamKind:
     """Tests for _get_param_kind function."""
 
@@ -418,6 +472,48 @@ class TestScanModule:
         symbols = scan_module(sample_module, include_private=True)
         func_names = [s.name for s in symbols if s.kind == "function"]
         assert "_private_function" in func_names
+
+    def test_scan_module_captures_c_function(self):
+        """A module-level lowercase library-typed callable is a function (#63)."""
+
+        class _CFuncLike:
+            # __module__ matches the module below, so it is treated as defined
+            # here (not a re-export) and reaches classification.
+            __module__ = "cfuncmod"
+
+            def __call__(self, x, y):
+                return x + y
+
+        mod = types.ModuleType("cfuncmod")
+        mod.__doc__ = "A C-extension-like module."
+        mod.add = _CFuncLike()
+
+        symbols = scan_module(mod, _package_root="cfuncmod")
+        by_id = {(s.module_path, s.qualified_name): s for s in symbols}
+
+        assert ("cfuncmod", "add") in by_id
+        sym = by_id[("cfuncmod", "add")]
+        assert sym.kind == "function"
+        assert sym.signature is not None
+        assert [p.name for p in sym.signature.params] == ["x", "y"]
+
+    def test_scan_module_uppercase_callable_stays_constant(self):
+        """The reverse: an UPPER_CASE callable remains a constant, not a function."""
+
+        class _Sentinel:
+            __module__ = "cfuncmod"
+
+            def __call__(self, *args, **kwargs):
+                return None
+
+        mod = types.ModuleType("cfuncmod")
+        mod.__doc__ = "A module with an UPPER_CASE callable sentinel."
+        mod.INT = _Sentinel()
+
+        symbols = scan_module(mod, _package_root="cfuncmod")
+        by_id = {(s.module_path, s.qualified_name): s for s in symbols}
+
+        assert by_id[("cfuncmod", "INT")].kind == "constant"
 
 
 class TestScanPackage:

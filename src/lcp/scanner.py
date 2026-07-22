@@ -730,6 +730,49 @@ def _is_constant(name: str, value: Any) -> bool:
     return top_level not in sys.stdlib_module_names
 
 
+def _is_c_function(name: str, obj: Any) -> bool:
+    """Whether *obj* is a C-implemented function to record under *name*.
+
+    C callables — ``numpy.add`` (a ``ufunc``), ``numpy.mean`` (an
+    ``_ArrayFunctionDispatcher``), Cython functions — are invisible to
+    ``inspect.isfunction``. This predicate recognises them at the same
+    classification points, using the naming boundary #61 already relies on:
+    a callable bound to an ``UPPER_CASE`` name is a constant, a lowercase one
+    is a function. It is consulted only after the class / Python-function /
+    constant checks have declined, so any callable reaching it is already
+    lowercase-named (``_is_constant`` rejects UPPER-named callables as
+    constants).
+
+    Admitted when the object is a library-typed callable with a recoverable
+    signature. The signature both confirms a useful symbol (not a bare name)
+    and separates a genuine C function from a value object whose
+    ``signature()`` raises (a proxy read outside its context). A stdlib-typed
+    callable — a re-bound builtin, a ``functools.partial`` — is not admitted;
+    only ``type(obj)`` is consulted, never the instance's own attributes.
+
+    Args:
+        name: Attribute name the object is bound to in its module.
+        obj: The object bound to that name.
+
+    Returns:
+        ``True`` when the symbol should be recorded as a C-implemented function.
+    """
+    if not callable(obj):
+        return False
+    if name.isupper():  # defensive: an UPPER_CASE callable is a constant (#61)
+        return False
+    top_level = str(type(obj).__module__ or "").split(".")[0]
+    if top_level in sys.stdlib_module_names:
+        return False
+    try:
+        inspect.signature(obj)
+    except Exception:
+        # A callable whose signature cannot be built is a value object, not a
+        # function; fail open to "not a function" rather than crash the scan.
+        return False
+    return True
+
+
 def _normalize_dist(name: str) -> str:
     """Normalise a distribution or top-level name for comparison.
 
@@ -948,8 +991,9 @@ def _capture_sibling_reexports(
     and renamed re-exports, and already imported) and capture it at its
     def-site with :func:`_capture_reexport`, passing ``target_name`` so the
     canonical ``qualified_name`` matches the record and :func:`_attach_aliases`
-    can bind the facade alias. Deferred callables (#63) yield ``None`` and are
-    left dangling. Deduped by canonical ``(module, name)`` key.
+    can bind the facade alias.
+    ``None`` from an unclassifiable object is skipped; the record is left
+    dangling. Deduped by canonical ``(module, name)`` key.
 
     Args:
         records: Alias records observed during the facade scan.
@@ -1074,11 +1118,10 @@ def _capture_sibling_value_reexports(
 def _reexport_kind(name: str, obj: Any) -> str:
     """Classify a followed foreign re-export.
 
-    Returns ``"class"``, ``"function"``, ``"value"`` or ``"defer"``. ``"defer"``
-    marks a callable with a recoverable signature — it looks like a
-    C-implemented function and is left for #63 rather than mislabelled a
-    constant here. A callable whose ``signature()`` raises (e.g. a proxy read
-    outside its context) is a value object, not a function.
+    Returns ``"class"``, ``"function"`` or ``"value"``. A signature-recoverable
+    library callable is a C-implemented function (see :func:`_is_c_function`);
+    a callable whose ``signature()`` raises (e.g. a proxy read outside its
+    context) is a value object, not a function.
 
     Args:
         name: Attribute name the object is bound to at the facade.
@@ -1093,11 +1136,11 @@ def _reexport_kind(name: str, obj: Any) -> str:
         return "function"
     if _is_constant(name, obj):
         return "value"
-    try:
-        inspect.signature(obj)
-    except Exception:
-        return "value"
-    return "defer"
+    if _is_c_function(name, obj):
+        return "function"
+    # A callable whose signature cannot be built (a proxy read outside its
+    # context) is a value object, not a function.
+    return "value"
 
 
 def _capture_reexport(
@@ -1107,7 +1150,7 @@ def _capture_reexport(
 
     A re-exported class is scanned with its *origin* top-level as the package
     root, so its own methods are kept rather than filtered out by the facade's
-    root. A deferred callable (see :func:`_reexport_kind`) yields ``None``.
+    root.
 
     Args:
         name: Attribute name at the facade.
@@ -1116,7 +1159,7 @@ def _capture_reexport(
         include_private: Whether to include private members (classes).
 
     Returns:
-        The captured symbol, or ``None`` when deferred to #63.
+        The captured symbol, or ``None`` for an unclassifiable object.
     """
     kind = _reexport_kind(name, obj)
     if kind == "class":
@@ -1286,6 +1329,10 @@ def scan_module(
                         summary=_constant_summary(obj),
                     )
                 )
+            elif _is_c_function(name, obj):
+                # C-implemented function defined in this module (#63): a
+                # lowercase library-typed callable inspect.isfunction misses.
+                symbols.append(_scan_function(obj, module_path, name))
         except KeyboardInterrupt:
             raise
         except Exception:
