@@ -808,6 +808,269 @@ def _is_followable_reexport(
     return top in followable_tops
 
 
+def _distribution_module_paths(files: Any) -> set[str]:
+    """Importable module paths derived from a distribution's file list.
+
+    Derives dotted module paths from ``.py`` files:
+    ``google/cloud/firestore_v1/client.py`` → ``google.cloud.firestore_v1.client``
+    and ``.../__init__.py`` → the package path. Only pure-Python (``.py``)
+    files are recognized; compiled extension modules (``.so``/``.pyd``) are not.
+
+    Args:
+        files: The distribution's file list (path-like entries), or ``None``.
+
+    Returns:
+        The set of importable module paths.
+    """
+    mods: set[str] = set()
+    for f in files or []:
+        parts = str(f).split("/")
+        if not parts[-1].endswith(".py"):
+            continue
+        parts[-1] = parts[-1][:-3]
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if parts and all(p.isidentifier() for p in parts):
+            mods.add(".".join(parts))
+    return mods
+
+
+def _own_distribution_modules(package_name: str) -> frozenset[str]:
+    """Module paths provided by the distribution(s) owning ``package_name``.
+
+    Finds every installed distribution whose file list contains
+    ``package_name``'s import path, and returns the union of the importable
+    module paths those distributions provide — including sibling packages that
+    share the distribution but not the scanned package's subtree (e.g.
+    ``google.cloud.firestore_v1`` for a scan of ``google.cloud.firestore``).
+
+    This is a lookup on the *scanned* distribution's own files, so it does not
+    hit the shared-namespace ambiguity that ``packages_distributions()`` has for
+    ``google``. Any failure yields an empty set, disabling the feature rather
+    than raising.
+
+    Args:
+        package_name: Import path of the scanned package.
+
+    Returns:
+        The provided module paths, or an empty set.
+    """
+    own_path = package_name.replace(".", "/") + "/"
+    own_file = package_name.replace(".", "/") + ".py"
+    try:
+        dists = list(importlib.metadata.distributions())
+    except Exception:
+        return frozenset()
+    provided: set[str] = set()
+    for dist in dists:
+        try:
+            files = getattr(dist, "files", None) or []
+            if any(str(f).startswith(own_path) or str(f) == own_file for f in files):
+                provided |= _distribution_module_paths(files)
+        except Exception:
+            continue
+    return frozenset(provided)
+
+
+def _is_sibling_module(
+    target_module: str, package_name: str, sibling_modules: frozenset[str]
+) -> bool:
+    """Whether ``target_module`` is a followable same-distribution sibling.
+
+    A sibling is a module that (1) lies outside the scanned package's own
+    subtree — so it is not a submodule that merely failed to import during the
+    walk — and (2) is provided by the scanned distribution's file list.
+
+    Args:
+        target_module: ``__module__`` of a dangling re-export target.
+        package_name: Import path of the scanned package.
+        sibling_modules: Module paths provided by the scanned distribution.
+
+    Returns:
+        ``True`` when ``target_module`` should be captured at its def-site.
+    """
+    if target_module == package_name or target_module.startswith(package_name + "."):
+        return False
+    return any(
+        target_module == m or target_module.startswith(m + ".")
+        for m in sibling_modules
+    )
+
+
+def _synth_module_symbol(module_path: str) -> ScannedSymbol:
+    """A minimal module-kind symbol for a captured sibling module.
+
+    Copies the real module's docstring when it imports cleanly (the module is
+    normally already imported to reach the captured object), else emits a bare
+    entry. Keeps the manifest's module listing describable — ``LCPIndex`` lists
+    a module for every symbol's ``module_path``, so a captured symbol's module
+    must have a module-kind entry like every other.
+
+    Args:
+        module_path: The def-site module path (e.g. ``google.cloud.firestore_v1.client``).
+
+    Returns:
+        A ``kind="module"`` ScannedSymbol.
+    """
+    summary = description = docstring = None
+    try:
+        mod = importlib.import_module(module_path)
+        summary, description = _parse_docstring(mod.__doc__)
+        docstring = _raw_docstring(mod.__doc__)
+    except Exception:
+        # Fail-open: an unimportable module (or a non-string ``__doc__``) still
+        # yields a bare module entry via the ``summary or f"Module ..."`` default
+        # below, rather than dropping the symbol or aborting the scan.
+        pass
+    return ScannedSymbol(
+        name=module_path,
+        qualified_name="",
+        module_path=module_path,
+        kind="module",
+        summary=summary or f"Module {module_path}",
+        description=description,
+        docstring=docstring,
+    )
+
+
+def _capture_sibling_reexports(
+    records: list[_AliasRecord],
+    existing: list[ScannedSymbol],
+    package_name: str,
+    sibling_modules: frozenset[str],
+    include_private: bool,
+) -> tuple[list[ScannedSymbol], list[ScannedSymbol]]:
+    """Capture facade re-exports that resolve to a same-distribution sibling.
+
+    For each dangling record whose target is a followable sibling
+    (:func:`_is_sibling_module`), re-fetch the object from the *observing*
+    module (``alias_module``/``alias_name`` — robust to nested ``__qualname__``
+    and renamed re-exports, and already imported) and capture it at its
+    def-site with :func:`_capture_reexport`, passing ``target_name`` so the
+    canonical ``qualified_name`` matches the record and :func:`_attach_aliases`
+    can bind the facade alias. Deferred callables (#63) yield ``None`` and are
+    left dangling. Deduped by canonical ``(module, name)`` key.
+
+    Args:
+        records: Alias records observed during the facade scan.
+        existing: Symbols already scanned (facade + its submodules).
+        package_name: Import path of the scanned facade.
+        sibling_modules: Module paths the scanned distribution provides.
+        include_private: Whether to include private class members.
+
+    Returns:
+        ``(captured_symbols, synthesized_module_symbols)``.
+    """
+    existing_keys = {(s.module_path, s.qualified_name) for s in existing}
+    captured: list[ScannedSymbol] = []
+    captured_keys: set[tuple[str, str]] = set()
+    def_modules: dict[str, None] = {}  # insertion-ordered set
+
+    for rec in records:
+        key = (rec.target_module, rec.target_name)
+        if key in existing_keys or key in captured_keys:
+            continue
+        if not _is_sibling_module(rec.target_module, package_name, sibling_modules):
+            continue
+        try:
+            obj = getattr(
+                importlib.import_module(rec.alias_module), rec.alias_name, None
+            )
+        except Exception:
+            obj = None
+        if obj is None:
+            continue
+        try:
+            sym = _capture_reexport(
+                rec.target_name, obj, rec.target_module, include_private
+            )
+        except Exception:
+            sym = None
+        if sym is None:
+            continue
+        captured.append(sym)
+        captured_keys.add(key)
+        def_modules[rec.target_module] = None
+
+    synth = [_synth_module_symbol(m) for m in def_modules]
+    return captured, synth
+
+
+def _capture_sibling_value_reexports(
+    module: ModuleType,
+    existing: list[ScannedSymbol],
+    package_name: str,
+    sibling_modules: frozenset[str],
+    include_private: bool,
+) -> list[ScannedSymbol]:
+    """Capture name-less value re-exports from a same-distribution sibling.
+
+    A module-level constant re-exported by a facade (e.g. a sentinel like
+    ``SERVER_TIMESTAMP``) is an instance with no ``__name__``, so ``scan_module``
+    creates no alias record for it and drops it. When such a value's
+    ``__module__`` resolves to a followable same-distribution sibling, capture it
+    at the facade (``package_name``) as a constant — there is no def-site
+    identity to alias to, and the facade path is idiomatic anyway. Entry module
+    only; deduped against symbols already captured. Name-bearing objects
+    (classes/functions) are handled by the alias-record path, not here.
+
+    Args:
+        module: The scanned facade (entry) module object.
+        existing: Symbols already captured (facade scan + sibling captures).
+        package_name: Import path of the scanned facade.
+        sibling_modules: Module paths the scanned distribution provides.
+        include_private: Whether to include private names.
+
+    Returns:
+        The captured constant symbols.
+    """
+    existing_keys = {(s.module_path, s.qualified_name) for s in existing}
+    captured: list[ScannedSymbol] = []
+    seen: set[str] = set()
+    # Defensive only: reaching this post-pass means scan_module already read
+    # module.__all__ during the main scan, so this cannot actually raise here.
+    try:
+        public_names = set(module.__all__) if hasattr(module, "__all__") else None
+    except Exception:
+        public_names = None
+    for name, obj in _safe_getmembers(module):
+        if not _is_public(name, include_private):
+            continue
+        if public_names is not None and name not in public_names:
+            continue
+        if name in seen or (package_name, name) in existing_keys:
+            continue
+        try:
+            if inspect.ismodule(obj):
+                continue
+            obj_module = getattr(obj, "__module__", None)
+            if not isinstance(obj_module, str):
+                continue
+            if not _is_sibling_module(obj_module, package_name, sibling_modules):
+                continue
+            # Name-bearing objects go through the alias-record path; only
+            # name-less values (sentinels) are captured here.
+            if isinstance(getattr(obj, "__name__", None), str):
+                continue
+            if not _is_constant(name, obj):
+                continue
+            captured.append(
+                ScannedSymbol(
+                    name=name,
+                    qualified_name=name,
+                    module_path=package_name,
+                    kind="constant",
+                    summary=_constant_summary(obj),
+                )
+            )
+            seen.add(name)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            continue
+    return captured
+
+
 def _reexport_kind(name: str, obj: Any) -> str:
     """Classify a followed foreign re-export.
 
@@ -1194,6 +1457,31 @@ def scan_package(
                     _followable_tops=None,
                 )
             )
+
+    # Facade shape A (#68): a re-export pointing OUTSIDE the scanned subtree but
+    # sharing the top-level namespace is a sibling implementation package. If it
+    # belongs to the scanned distribution, capture the re-exported names at their
+    # def-site so the dangling alias records resolve. The guard keeps the
+    # file-list walk off the common path (no out-of-subtree re-exports).
+    has_out_of_subtree_reexport = any(
+        not (
+            rec.target_module == package_name
+            or rec.target_module.startswith(package_name + ".")
+        )
+        for rec in alias_records
+    )
+    if has_out_of_subtree_reexport:
+        sibling_modules = _own_distribution_modules(package_name)
+        if sibling_modules:
+            captured, synth_modules = _capture_sibling_reexports(
+                alias_records, symbols, package_name, sibling_modules, include_private
+            )
+            symbols.extend(synth_modules)
+            symbols.extend(captured)
+            value_captured = _capture_sibling_value_reexports(
+                module, symbols, package_name, sibling_modules, include_private
+            )
+            symbols.extend(value_captured)
 
     unresolved = _attach_aliases(symbols, alias_records, package_name)
     return ScannedModule(
