@@ -1,17 +1,23 @@
 """Tests for the scanner module."""
 
 import inspect
+import os
+import sys
 import types
 
 import pytest
 from hostile_objects import Hostile, HostileProxy
 
+import tests.repro_fixture as reprofix
 from lcp.scanner import (
     ScannedModule,
     ScannedParam,
+    _constant_source_expr,
+    _constant_summary,
     _get_param_kind,
     _is_c_function,
     _is_constant,
+    _is_env_derived_str,
     _is_member_from_package,
     _is_public,
     _parse_docstring,
@@ -19,6 +25,7 @@ from lcp.scanner import (
     _scan_function,
     _scan_signature,
     _type_to_string,
+    _usable_expr,
     scan_module,
     scan_package,
 )
@@ -1290,3 +1297,268 @@ class TestConstantSummary:
 
         value = MyStr("hello")
         assert _constant_summary(value) == f"MyStr constant: {value!r}"
+
+
+class TestIsEnvDerivedStr:
+    """Tests for _is_env_derived_str."""
+
+    def test_sys_executable_is_env_derived(self):
+        assert _is_env_derived_str(sys.executable) is True
+
+    def test_path_under_prefix_is_env_derived(self):
+        assert _is_env_derived_str(os.path.join(sys.prefix, "share", "x")) is True
+
+    def test_path_under_home_is_env_derived(self):
+        assert _is_env_derived_str(os.path.expanduser("~/.cache/app")) is True
+
+    def test_plain_string_is_not_env_derived(self):
+        assert _is_env_derived_str("GET") is False
+
+    def test_url_path_is_not_env_derived(self):
+        assert _is_env_derived_str("/api/v1") is False
+
+    def test_non_string_is_not_env_derived(self):
+        assert _is_env_derived_str(200) is False
+        assert _is_env_derived_str(None) is False
+
+    def test_empty_string_is_not_env_derived(self):
+        assert _is_env_derived_str("") is False
+
+    def test_hostile_getattr_is_not_env_derived(self):
+        assert _is_env_derived_str(Hostile()) is False
+
+    def test_hostile_getattribute_is_not_env_derived(self):
+        assert _is_env_derived_str(HostileProxy()) is False
+
+
+class TestUsableExpr:
+    """Tests for _usable_expr."""
+
+    def test_none_stays_none(self):
+        assert _usable_expr(None) is None
+
+    def test_short_expr_passes(self):
+        assert _usable_expr("sys.executable") == "sys.executable"
+
+    def test_overlong_expr_rejected(self):
+        assert _usable_expr("x" * 200) is None
+
+    def test_expr_at_max_length_kept(self):
+        assert _usable_expr("x" * 80) == "x" * 80
+
+    def test_expr_one_over_max_length_rejected(self):
+        assert _usable_expr("x" * 81) is None
+
+
+class TestDefaultAstInfo:
+    """AST literal-ness + source expr per default (#72 follow-up)."""
+
+    def test_reports_literal_and_computed(self):
+        from lcp.scanner import _default_ast_info
+
+        info = _default_ast_info(reprofix.connect)
+        assert info["exe"] == (False, "sys.executable")
+        assert info["cache"] == (False, 'os.path.expanduser("~/.cache/app")')
+        assert info["retries"] == (True, "3")
+
+    def test_unparseable_object_fails_open(self):
+        from lcp.scanner import _default_ast_info
+
+        assert _default_ast_info(len) == {}
+
+
+class TestConstantSourceExpr:
+    """Tests for _constant_source_expr."""
+
+    def test_recovers_assignment_rhs(self):
+        assert _constant_source_expr(reprofix, "DATA_ROOT") == (
+            'os.path.join(sys.prefix, "share", "data")'
+        )
+
+    def test_missing_name_returns_none(self):
+        assert _constant_source_expr(reprofix, "NOT_THERE") is None
+
+
+class TestConstantSummaryEnvDerived:
+    """#72: env-derived constants must not leak resolved paths."""
+
+    def test_env_constant_uses_symbolic_form(self):
+        symbols = scan_module(reprofix)
+        data_root = next(s for s in symbols if s.name == "DATA_ROOT")
+        assert data_root.summary == 'str constant: os.path.join(sys.prefix, "share", "data")'
+        assert sys.prefix not in data_root.summary
+
+    def test_plain_constant_unchanged(self):
+        symbols = scan_module(reprofix)
+        greeting = next(s for s in symbols if s.name == "GREETING")
+        assert greeting.summary == "str constant: 'GET'"
+        retries = next(s for s in symbols if s.name == "MAX_RETRIES")
+        assert retries.summary == "int constant: 3"
+
+    def test_env_constant_without_context_is_type_only(self):
+        from lcp.scanner import _constant_summary
+
+        leaked = os.path.join(sys.prefix, "share", "data")
+        assert _constant_summary(leaked) == "str constant."
+
+
+class TestSignatureDefaultsEnvDerived:
+    """#72: env-derived signature defaults must not leak resolved paths."""
+
+    def test_env_default_becomes_expr(self):
+        from lcp.scanner import _ExprDefault
+
+        sig = _scan_signature(reprofix.connect)
+        exe = next(p for p in sig.params if p.name == "exe")
+        assert isinstance(exe.default, _ExprDefault)
+        assert exe.default.expr == "sys.executable"
+        cache = next(p for p in sig.params if p.name == "cache")
+        assert cache.default.expr == 'os.path.expanduser("~/.cache/app")'
+
+    def test_plain_default_unchanged(self):
+        sig = _scan_signature(reprofix.connect)
+        retries = next(p for p in sig.params if p.name == "retries")
+        assert retries.default == 3
+
+    def test_expr_default_round_trips(self):
+        from lcp.scanner import (
+            _ExprDefault,
+            _default_from_dict,
+            _default_to_dict,
+        )
+
+        d = _default_to_dict(_ExprDefault("sys.executable"))
+        assert d == {"kind": "expr", "expr": "sys.executable"}
+        restored = _default_from_dict(d)
+        assert isinstance(restored, _ExprDefault)
+        assert restored.expr == "sys.executable"
+
+
+class TestStringDefaultLiteralRule:
+    """#72 follow-up: computed string defaults are symbolic; literals keep value."""
+
+    def test_computed_call_default_is_expr(self):
+        from lcp.scanner import _ExprDefault
+
+        sig = _scan_signature(reprofix.make_tmp)
+        stamp = next(p for p in sig.params if p.name == "stamp")
+        assert isinstance(stamp.default, _ExprDefault)
+        assert stamp.default.expr == 'datetime.now().strftime("%Y%m%d")'
+
+    def test_computed_attribute_default_is_expr(self):
+        from lcp.scanner import _ExprDefault
+
+        sig = _scan_signature(reprofix.make_tmp)
+        sep = next(p for p in sig.params if p.name == "sep")
+        assert isinstance(sep.default, _ExprDefault)
+        assert sep.default.expr == "os.linesep"
+
+    def test_literal_string_default_keeps_value(self):
+        sig = _scan_signature(reprofix.make_tmp)
+        label = next(p for p in sig.params if p.name == "label")
+        assert label.default == "run"
+
+    def test_int_default_unchanged(self):
+        sig = _scan_signature(reprofix.connect)
+        retries = next(p for p in sig.params if p.name == "retries")
+        assert retries.default == 3
+
+
+class TestNumericDefaultLiteralRule:
+    """#72: computed numeric defaults are symbolic; numeric literals keep value."""
+
+    def test_computed_numeric_default_is_expr(self):
+        from lcp.scanner import _ExprDefault
+
+        sig = _scan_signature(reprofix.budget)
+        created = next(p for p in sig.params if p.name == "created_at")
+        assert isinstance(created.default, _ExprDefault)
+        assert created.default.expr == "time.time()"
+
+    def test_negative_literal_default_keeps_int_value(self):
+        sig = _scan_signature(reprofix.budget)
+        retries = next(p for p in sig.params if p.name == "retries")
+        assert retries.default == -1
+        assert type(retries.default) is int  # NOT the string "-1"
+
+    def test_float_and_bool_literals_kept(self):
+        sig = _scan_signature(reprofix.budget)
+        factor = next(p for p in sig.params if p.name == "factor")
+        flag = next(p for p in sig.params if p.name == "flag")
+        assert factor.default == 2.0
+        assert flag.default is False
+
+
+class TestSubclassPrimitiveDefault:
+    """#72: an int-subclass sentinel default is emitted symbolically, not as its int value."""
+
+    def test_int_subclass_sentinel_is_symbolic(self):
+        from lcp.scanner import _ExprDefault
+
+        sig = _scan_signature(reprofix.with_sentinel)
+        original = next(p for p in sig.params if p.name == "original")
+        assert isinstance(original.default, _ExprDefault)
+        assert original.default.expr == "_NO_HISTORY"
+
+    def test_plain_literal_alongside_sentinel_kept(self):
+        sig = _scan_signature(reprofix.with_sentinel)
+        n = next(p for p in sig.params if p.name == "n")
+        assert n.default == 5
+
+
+class TestFrozensetRendering:
+    """#72 follow-up: frozenset constants must render deterministically."""
+
+    def test_render_sorted_by_repr(self):
+        from lcp.scanner import _render_frozenset
+
+        # natural iteration order is hash-dependent; output must be sorted
+        assert _render_frozenset(frozenset({"banana", "apple", "cherry"}), "frozenset") == (
+            "frozenset({'apple', 'banana', 'cherry'})"
+        )
+
+    def test_render_empty(self):
+        from lcp.scanner import _render_frozenset
+
+        assert _render_frozenset(frozenset(), "frozenset") == "frozenset()"
+
+    def test_render_uses_type_name_for_subclass(self):
+        from lcp.scanner import _render_frozenset
+
+        class DataTypeGroup(frozenset):
+            pass
+
+        assert _render_frozenset(DataTypeGroup({"c", "a", "b"}), "DataTypeGroup") == (
+            "DataTypeGroup({'a', 'b', 'c'})"
+        )
+
+    def test_constant_summary_frozenset_is_sorted(self):
+        # end-to-end through _constant_summary
+        s = _constant_summary(frozenset({"z", "y", "x"}))
+        assert s == "frozenset constant: frozenset({'x', 'y', 'z'})"
+
+    def test_constant_summary_frozenset_order_independent(self):
+        a = _constant_summary(frozenset(["one", "two", "three"]))
+        b = _constant_summary(frozenset(["three", "one", "two"]))
+        assert a == b
+
+
+class TestScanSignatureHostileDefault:
+    """#72: a hostile default must not crash or drop the signature scan."""
+
+    def test_hostile_class_property_default_is_safe(self):
+        class _Hostile:
+            @property
+            def __class__(self):
+                raise RuntimeError("working outside of request context")
+
+        def f(x=_Hostile(), n=5):
+            return x, n
+
+        # must not raise, and must still return the signature with both params
+        sig = _scan_signature(f)
+        assert sig is not None
+        names = {p.name for p in sig.params}
+        assert names == {"x", "n"}
+        # the plain literal is unaffected
+        assert next(p for p in sig.params if p.name == "n").default == 5

@@ -1,12 +1,18 @@
 """Tests for the generator module."""
 
+import json
+import os
+import sys
 
+import tests.repro_fixture as reprofix
 from lcp.generator import (
+    _build_detailed_index_entry,
     _build_symbol_id,
     _convert_param,
     _convert_signature,
     _convert_symbol,
     _param_kind_to_lcp,
+    _relativize_source_path,
     _symbol_kind_to_lcp,
     generate_lcp,
 )
@@ -20,6 +26,8 @@ from lcp.scanner import (
     ScannedParam,
     ScannedSignature,
     ScannedSymbol,
+    _ExprDefault,
+    scan_module,
     scan_package,
 )
 
@@ -325,7 +333,10 @@ class TestGenerateLcp:
         assert doc.detailed_index is not None
         assert "testlib:my_func" in doc.detailed_index
         entry = doc.detailed_index["testlib:my_func"]
-        assert entry.implementation.path == "/path/to/file.py"
+        # #72: no site-packages/dist-packages/pythonX.Y marker in this path,
+        # so it falls back to the bare basename rather than leaking the
+        # absolute machine-specific path.
+        assert entry.implementation.path == "file.py"
         assert entry.implementation.lines == [10, 20]
 
 
@@ -468,3 +479,89 @@ class TestStructuredDocstrings:
         assert symbol.semantics.summary == scanned.summary
         assert symbol.semantics.description == scanned.description
         assert symbol.signatures[0].raises is None
+
+
+class TestConvertParamExprDefault:
+    """#72: expr defaults are emitted verbatim, not as '...'."""
+
+    def test_expr_default_emitted_verbatim(self):
+        scanned = ScannedParam(
+            name="exe", type_hint="str", default=_ExprDefault("sys.executable")
+        )
+        param = _convert_param(scanned)
+        assert param.required is False
+        assert param.default == "sys.executable"
+
+
+class TestRelativizeSourcePath:
+    """#72: detailed_index paths are package-relative, never absolute."""
+
+    def test_site_packages_tail(self):
+        p = "/tmp/x/venv/lib/python3.12/site-packages/requests/sessions.py"
+        assert _relativize_source_path(p) == "requests/sessions.py"
+
+    def test_stdlib_tail(self):
+        p = "/home/u/.pyenv/versions/3.12.0/lib/python3.12/contextlib.py"
+        assert _relativize_source_path(p) == "contextlib.py"
+
+    def test_nested_stdlib_tail(self):
+        p = "/home/u/.pyenv/versions/3.12.0/lib/python3.12/importlib/metadata.py"
+        assert _relativize_source_path(p) == "importlib/metadata.py"
+
+    def test_unknown_layout_falls_back_to_basename(self):
+        assert _relativize_source_path("/home/u/proj/src/lcp/scanner.py") == "scanner.py"
+
+    def test_build_entry_relativizes(self):
+        scanned = ScannedSymbol(
+            name="Session",
+            qualified_name="Session",
+            module_path="requests",
+            kind="class",
+            source_file="/tmp/venv/lib/python3.12/site-packages/requests/sessions.py",
+            source_lines=(1, 10),
+        )
+        entry = _build_detailed_index_entry(scanned)
+        assert entry.implementation.path == "requests/sessions.py"
+
+
+class TestReproducibilityInvariant:
+    """#72: no generated manifest string may embed an environment root."""
+
+    def _manifest_json(self):
+        symbols = scan_module(reprofix)
+        scanned = ScannedModule(
+            name="repro_fixture", version="0.0.0", symbols=symbols
+        )
+        doc = generate_lcp(scanned)
+        return doc.model_dump_json()
+
+    def test_no_env_roots_in_manifest(self):
+        blob = self._manifest_json()
+        for root in (sys.prefix, sys.base_prefix, os.path.expanduser("~")):
+            assert root not in blob, f"environment root leaked: {root}"
+        assert sys.executable not in blob
+
+    def test_two_scans_are_identical(self):
+        # generation.date is a live wall-clock timestamp (datetime.now(UTC) in
+        # generator.py), not an environment root — exclude it so this checks
+        # content determinism, the invariant this test targets.
+        first = json.loads(self._manifest_json())
+        second = json.loads(self._manifest_json())
+        del first["manifest"]["generation"]["date"]
+        del second["manifest"]["generation"]["date"]
+        assert first == second
+
+    def test_frozenset_constant_is_sorted(self):
+        symbols = scan_module(reprofix)
+        schemes = next(s for s in symbols if s.name == "SCHEMES")
+        assert schemes.summary == "frozenset constant: frozenset({'ftp', 'http', 'https'})"
+
+    def test_computed_string_defaults_are_symbolic(self):
+        # The resolved timestamp / resolved os.linesep must not be emitted;
+        # the source expressions must be.
+        d = json.loads(self._manifest_json())
+        make_tmp = d["symbols"]["tests.repro_fixture:make_tmp"]
+        params = {p["name"]: p.get("default") for p in make_tmp["signatures"][0]["params"]}
+        assert params["stamp"] == 'datetime.now().strftime("%Y%m%d")'
+        assert params["sep"] == "os.linesep"
+        assert params["label"] == "run"

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.metadata
 import inspect
+import os
 import pkgutil
 import re
 import sys
+import tempfile
+import textwrap
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,10 +101,56 @@ _COMPLEX_DEFAULT = _ComplexDefault()
 _PRIMITIVE_DEFAULT_TYPES = (str, int, float, bool)
 
 
+def _is_primitive_default(value: object) -> bool:
+    """Whether *value* is (an instance of) a primitive the generator emits verbatim.
+
+    Mirrors :func:`_is_primitive`'s hostile-safe shape: a ``type(...) in`` fast
+    path that never touches the object, then a guarded ``isinstance`` fallback so
+    a primitive **subclass** (e.g. a sentinel like sqlalchemy's ``symbol`` — an
+    ``int`` subclass) is still recognised. The fallback reads ``__class__``, which
+    a hostile proxy can make raise, so it is wrapped: any failure returns
+    ``False`` rather than escaping (which would drop the whole symbol from the
+    scan). The set matches ``_PRIMITIVE_DEFAULT_TYPES`` — exactly what
+    ``_convert_param``/``_default_to_dict`` emit as a value.
+
+    Args:
+        value: The default object to classify.
+
+    Returns:
+        ``True`` when *value* is a str/int/float/bool (or subclass instance).
+    """
+    if type(value) in _PRIMITIVE_DEFAULT_TYPES:
+        return True
+    try:
+        return isinstance(value, _PRIMITIVE_DEFAULT_TYPES)
+    except Exception:
+        return False
+
+
+class _ExprDefault:
+    """Carries the source expression of an environment-derived default.
+
+    Round-trips ``ScannedParam.default`` across the subprocess boundary as an
+    ``expr`` descriptor. It is not ``inspect.Parameter.empty`` (so
+    ``has_default`` stays ``True``); the generator emits ``.expr`` verbatim
+    instead of a resolved, per-machine value (#72).
+    """
+
+    __slots__ = ("expr",)
+
+    def __init__(self, expr: str) -> None:
+        self.expr = expr
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<expr default: {self.expr}>"
+
+
 def _default_to_dict(default: Any) -> dict:
     """Encode a ``ScannedParam.default`` into a JSON-safe descriptor."""
     if default is inspect.Parameter.empty:
         return {"kind": "empty"}
+    if isinstance(default, _ExprDefault):
+        return {"kind": "expr", "expr": default.expr}
     if default is None or isinstance(default, _PRIMITIVE_DEFAULT_TYPES):
         return {"kind": "primitive", "value": default}
     return {"kind": "complex"}
@@ -111,6 +161,8 @@ def _default_from_dict(d: dict) -> Any:
     kind = d.get("kind", "empty")
     if kind == "primitive":
         return d.get("value")
+    if kind == "expr":
+        return _ExprDefault(d.get("expr", ""))
     if kind == "complex":
         return _COMPLEX_DEFAULT
     return inspect.Parameter.empty
@@ -400,6 +452,157 @@ def _type_to_string(type_hint: Any) -> str | None:
     return str(type_hint)
 
 
+_MAX_SYMBOLIC_EXPR = 80
+
+
+def _is_env_derived_str(value: object) -> bool:
+    """Return whether *value* is a string rooted in this install's environment.
+
+    True only when *value* is a non-empty ``str`` that starts with an
+    environment root (``sys.prefix``/``base_prefix``/``exec_prefix``, the user
+    home, or the temp dir) or equals ``sys.executable``. These are the values
+    that differ per machine and per install; a plain string such as ``"GET"`` or
+    a logical path like ``"/api/v1"`` is not env-derived.
+
+    ``isinstance`` is not safe here, for the same reason it is unsafe in
+    :func:`_is_primitive`: its ``__class__`` fallback goes through a hostile
+    object's ``__getattribute__``/``__getattr__`` and a non-``AttributeError``
+    (e.g. ``RuntimeError`` from a ``flask.request``-shaped proxy) propagates
+    out of what reads like a pure predicate. The ``type(value) is str``
+    identity check settles the common case without touching the object at
+    all, so this function stays true to its fail-open contract for any
+    object, hostile or not.
+
+    Args:
+        value: Any object; only ``str`` can be env-derived.
+
+    Returns:
+        ``True`` if the value embeds this environment, else ``False``.
+    """
+    if type(value) is not str or not value:
+        return False
+    if value == sys.executable:
+        return True
+    norm = os.path.normpath(value)
+    roots = (
+        sys.prefix,
+        sys.base_prefix,
+        sys.exec_prefix,
+        os.path.expanduser("~"),
+        tempfile.gettempdir(),
+    )
+    for root in roots:
+        if root and norm.startswith(os.path.normpath(root) + os.sep):
+            return True
+    return False
+
+
+def _usable_expr(seg: str | None) -> str | None:
+    """Return *seg* if it is a short, non-empty source expression, else None.
+
+    An over-long expression is not clearly more useful than omission, so it is
+    rejected (the caller then omits the value).
+    """
+    if seg is None:
+        return None
+    return seg if 0 < len(seg) <= _MAX_SYMBOLIC_EXPR else None
+
+
+def _is_literal_default(node: ast.expr) -> bool:
+    """Whether an AST default node is a reproducible literal.
+
+    ``ast.Constant`` covers bare literals; a signed numeric literal such as
+    ``-1`` or ``+3.14`` parses as ``ast.UnaryOp`` over a ``Constant`` and must
+    also count as a literal (otherwise it would be emitted as a source
+    expression instead of its value).
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    return (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, (ast.UAdd, ast.USub))
+        and isinstance(node.operand, ast.Constant)
+    )
+
+
+def _default_ast_info(func: object) -> dict[str, tuple[bool, str | None]]:
+    """Map each of *func*'s defaults to ``(is_literal, usable_source_expr)``.
+
+    ``is_literal`` is ``True`` when the default's AST node is a reproducible
+    literal per :func:`_is_literal_default` — a bare ``ast.Constant`` or a
+    signed numeric literal (``-1``, ``+3.14``) — whose resolved value can be
+    trusted. The expression is the usable source segment (``None`` when
+    over-long, per :func:`_usable_expr`). A parameter appears in the map only
+    when its default's AST node was found; absence means the source was
+    unavailable or unparseable. Fails open to ``{}`` (C callables, dynamically
+    built signatures).
+
+    Args:
+        func: The callable whose defaults to inspect.
+
+    Returns:
+        ``{parameter_name: (is_literal, usable_source_expr)}``.
+    """
+    try:
+        src = textwrap.dedent(inspect.getsource(func))
+        tree = ast.parse(src)
+        fn = next(
+            (n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))),
+            None,
+        )
+        if fn is None:
+            return {}
+        args = fn.args
+        out: dict[str, tuple[bool, str | None]] = {}
+        posargs = args.posonlyargs + args.args
+        for arg, default in zip(posargs[len(posargs) - len(args.defaults):], args.defaults):
+            out[arg.arg] = (
+                _is_literal_default(default),
+                _usable_expr(ast.get_source_segment(src, default)),
+            )
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+            if default is not None:
+                out[arg.arg] = (
+                    _is_literal_default(default),
+                    _usable_expr(ast.get_source_segment(src, default)),
+                )
+        return out
+    except (OSError, TypeError, SyntaxError, ValueError):
+        return {}
+
+
+def _constant_source_expr(module: object, name: str) -> str | None:
+    """Recover the RHS source expression of a top-level ``name = ...`` in *module*.
+
+    Fails open: returns ``None`` when the module source is unavailable, the name
+    is not a top-level assignment, or the expression is over-long.
+
+    Args:
+        module: The module object where the constant is defined.
+        name: The constant's binding name.
+
+    Returns:
+        The source expression (e.g. ``"certs.where()"``) or ``None``.
+    """
+    try:
+        src = inspect.getsource(module)
+        tree = ast.parse(src)
+        for node in tree.body:
+            targets: list[str] = []
+            value: ast.expr | None = None
+            if isinstance(node, ast.Assign):
+                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                value = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                targets = [node.target.id]
+                value = node.value
+            if name in targets and value is not None:
+                return _usable_expr(ast.get_source_segment(src, value))
+        return None
+    except (OSError, TypeError, SyntaxError, ValueError):
+        return None
+
+
 def _get_param_kind(param: inspect.Parameter) -> str:
     """Convert inspect parameter kind to LCP kind."""
     kind_map = {
@@ -426,18 +629,35 @@ def _scan_signature(obj: Any) -> ScannedSignature | None:
         hints = {}
 
     params = []
+    primitive_default_names = [
+        name
+        for name, param in sig.parameters.items()
+        if _is_primitive_default(param.default)
+    ]
+    info = _default_ast_info(obj) if primitive_default_names else {}
     for name, param in sig.parameters.items():
         if name in ("self", "cls"):
             continue
 
         type_hint = hints.get(name, param.annotation)
+        default = param.default
+        if name in primitive_default_names:
+            ast_info = info.get(name)
+            if ast_info is None:
+                # AST unrecoverable: never emit a leaked env-derived path.
+                if _is_env_derived_str(default):
+                    default = _COMPLEX_DEFAULT
+            else:
+                is_literal, expr = ast_info
+                if not is_literal:
+                    default = _ExprDefault(expr) if expr is not None else _COMPLEX_DEFAULT
         params.append(
             ScannedParam(
                 name=name,
                 type_hint=_type_to_string(type_hint)
                 if type_hint is not inspect.Parameter.empty
                 else None,
-                default=param.default,
+                default=default,
                 kind=_get_param_kind(param),
             )
         )
@@ -1181,14 +1401,40 @@ def _capture_reexport(
 _MAX_CONSTANT_REPR = 60
 
 
-def _constant_summary(value: Any) -> str:
+def _render_frozenset(value: frozenset, type_name: str) -> str:
+    """Render a frozenset deterministically, elements sorted by ``repr``.
+
+    ``frozenset`` iteration order is ``PYTHONHASHSEED``-dependent, so ``repr()``
+    varies between processes and breaks reproducibility (#72 follow-up).
+    Sorting the element reprs yields a stable order, and building the string
+    here — rather than calling the value's own ``__repr__`` — makes
+    ``frozenset`` subclasses with a custom repr (e.g. polars ``DataTypeGroup``)
+    deterministic too. The value's type name is used so the rendered form keeps
+    parity with the current output.
+
+    Args:
+        value: The frozenset (or subclass instance) to render.
+        type_name: ``type(value).__name__``.
+
+    Returns:
+        e.g. ``"frozenset({'a', 'b', 'c'})"`` or ``"frozenset()"`` when empty.
+    """
+    elements = sorted(map(repr, value))
+    if not elements:
+        return f"{type_name}()"
+    return f"{type_name}({{{', '.join(elements)}}})"
+
+
+def _constant_summary(value: Any, module: Any = None, name: str | None = None) -> str:
     """Build the summary line for a constant symbol.
 
     Primitives carry their value; everything else carries only its type name.
-    The value is deliberately withheld for non-primitives: ``__repr__`` on an
-    arbitrary object can be enormous, expensive, or raise. Primitive
-    detection goes through ``_is_primitive`` rather than a bare
-    ``isinstance`` call, which is not safe on a hostile object.
+    When the value is environment-derived (an absolute path rooted in this
+    install — see :func:`_is_env_derived_str`) the resolved value is never
+    emitted: instead the defining source expression is recovered from the AST
+    (e.g. ``"str constant: certs.where()"``) when *module* and *name* are given
+    and the source is parseable, and otherwise the summary degrades to the
+    type-only form. This keeps the output reproducible across machines (#72).
 
     Two of the primitive types, ``tuple`` and ``frozenset``, are containers
     that can hold arbitrary objects, and ``str``/``bytes`` can be subclassed
@@ -1197,17 +1443,38 @@ def _constant_summary(value: Any) -> str:
     type-only form rather than letting the exception escape (which would
     otherwise drop the whole symbol from the scan).
 
+    ``_is_env_derived_str`` is hostile-safe on its own (it uses a
+    ``type(value) is str`` identity check rather than ``isinstance`` before
+    touching the value), so it is called directly here without a call-site
+    guard.
+
     Args:
         value: The object bound to the constant's name.
+        module: The module object where the constant is defined, when known.
+            Enables symbolic recovery for env-derived values.
+        name: The constant's binding name, when known.
 
     Returns:
-        e.g. ``"int constant: 100"`` or ``"Sentinel constant."``.
+        e.g. ``"int constant: 100"``, ``"str constant: certs.where()"``, or
+        ``"Sentinel constant."``.
     """
     type_name = type(value).__name__
+    if _is_env_derived_str(value):
+        expr = (
+            _constant_source_expr(module, name)
+            if module is not None and name is not None
+            else None
+        )
+        if expr is not None:
+            return f"{type_name} constant: {expr}"
+        return f"{type_name} constant."
     if not _is_primitive(value):
         return f"{type_name} constant."
     try:
-        rendered = repr(value)
+        if isinstance(value, frozenset):
+            rendered = _render_frozenset(value, type_name)
+        else:
+            rendered = repr(value)
     except Exception:
         return f"{type_name} constant."
     if len(rendered) > _MAX_CONSTANT_REPR:
@@ -1326,7 +1593,7 @@ def scan_module(
                         qualified_name=name,
                         module_path=module_path,
                         kind="constant",
-                        summary=_constant_summary(obj),
+                        summary=_constant_summary(obj, module=module, name=name),
                     )
                 )
             elif _is_c_function(name, obj):
