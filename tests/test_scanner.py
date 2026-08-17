@@ -103,6 +103,30 @@ class TestTypeToString:
         result = _type_to_string(Union[str, int])
         assert "str" in result or "Union" in result
 
+    def test_instance_hint_does_not_leak_memory_address(self):
+        """A hint resolved to an instance must not bake a memory address in (#75).
+
+        When ``get_type_hints()`` resolves a forward reference to a live
+        *instance* rather than a class (e.g. cryptography 50.0.0 resolves
+        ``'DHPrivateNumbers'`` to a module-level ``_DeprecatedValue`` shim
+        instance), the fallback used ``str()``, whose default
+        ``object.__repr__`` ("<... object at 0x...>") embeds ``id()`` and so
+        changes on every scan — breaking manifest determinism.
+        """
+
+        class _Shim:  # default object.__repr__ -> "<... object at 0x...>"
+            pass
+
+        result = _type_to_string(_Shim())
+
+        assert result is not None
+        # No per-process memory address may survive into the manifest.
+        assert "0x" not in result
+        assert "object at" not in result
+        # Determinism: a second instance of the same class serializes
+        # identically (output must not depend on id()).
+        assert _type_to_string(_Shim()) == result
+
 
 class TestIsPublic:
     """Tests for _is_public function."""

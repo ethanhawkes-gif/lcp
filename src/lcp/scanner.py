@@ -418,6 +418,13 @@ def _parse_docstring(docstring: str | None) -> tuple[str | None, str | None]:
     return summary, description if description else None
 
 
+# CPython's default ``object.__repr__`` embeds the object's ``id()`` as a
+# memory address (``<pkg.Cls object at 0x10868f980>``), which changes on every
+# process. Strip that volatile fragment so any fallback repr stays stable and
+# environment-independent across scans (#75).
+_OBJECT_ADDRESS_RE = re.compile(r" at 0x[0-9a-fA-F]+(?=>)")
+
+
 def _type_to_string(type_hint: Any) -> str | None:
     """Convert a type hint to a string representation."""
     if type_hint is None or type_hint is inspect.Parameter.empty:
@@ -449,7 +456,15 @@ def _type_to_string(type_hint: Any) -> str | None:
     if hasattr(type_hint, "__name__"):
         return type_hint.__name__
 
-    return str(type_hint)
+    # The hint is neither a class, a typing construct, nor a string. This
+    # happens when get_type_hints() resolves a forward reference to a live
+    # *instance* instead of a class -- e.g. a module-level deprecation shim
+    # (cryptography 50.0.0 resolves 'DHPrivateNumbers' to a
+    # cryptography.utils._DeprecatedValue instance). Such an instance has no
+    # __name__ and falls back to object.__repr__, whose embedded memory address
+    # changes on every scan and breaks manifest determinism (#75). Strip the
+    # address so the fallback is stable and environment-independent.
+    return _OBJECT_ADDRESS_RE.sub("", str(type_hint))
 
 
 _MAX_SYMBOLIC_EXPR = 80
