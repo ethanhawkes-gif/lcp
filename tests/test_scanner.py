@@ -4,6 +4,7 @@ import inspect
 import os
 import sys
 import types
+from typing import get_type_hints
 
 import pytest
 from hostile_objects import Hostile, HostileProxy
@@ -364,6 +365,21 @@ class TestScannedParam:
         assert param_normal.is_variadic is False
 
 
+class _DeprecatedValueShim:  # opaque: no __name__, default object.__repr__
+    """Mimics cryptography 50.0.0's module-level ``_DeprecatedValue`` shim (#75)."""
+
+
+# Bound to the exact name a forward reference resolves to, at module scope so
+# that get_type_hints() collapses the annotation to this opaque instance via the
+# probe's __globals__ -- reproducing the cryptography 50.0.0 shape with no
+# external dependency.
+DHPrivateNumbers = _DeprecatedValueShim()
+
+
+def _dh_private_numbers_probe(arg: "DHPrivateNumbers") -> "DHPrivateNumbers":
+    """Forward ref get_type_hints() collapses to the opaque shim instance (#75)."""
+
+
 class TestScanSignature:
     """Tests for _scan_signature function."""
 
@@ -400,6 +416,39 @@ class TestScanSignature:
         sig = _scan_signature(func)
         assert len(sig.params) == 2
         assert sig.params[0].type_hint is None
+
+    def test_forward_reference_to_instance_keeps_symbolic_name(self):
+        """A forward ref collapsed to an opaque instance keeps its name (#75).
+
+        cryptography 48.0.1 / 49.0.0 publish ``"DHPrivateNumbers"`` for
+        ``DHPrivateKey#private_numbers``. In 50.0.0, ``get_type_hints()``
+        resolves that same forward reference to a module-level
+        ``_DeprecatedValue`` shim *instance* (no ``__name__``), which would
+        erase the symbolic name and — after the address is stripped — publish
+        ``"<... _DeprecatedValue object>"`` instead, spuriously flagging an API
+        change on symbols whose public API did not change. ``inspect.signature``
+        still holds the raw ``'DHPrivateNumbers'`` string, so the symbolic name
+        must survive on both the parameter and the return call sites.
+
+        ``_dh_private_numbers_probe`` (module scope) reproduces that shape
+        hermetically: its forward reference resolves, via the module globals,
+        to ``DHPrivateNumbers`` — an opaque shim instance, no external dep.
+        """
+        func = _dh_private_numbers_probe
+
+        # Precondition: get_type_hints() collapses the forward ref to the
+        # opaque instance (no __name__), exactly as cryptography 50.0.0 does.
+        resolved = get_type_hints(func)
+        assert not hasattr(resolved["return"], "__name__")
+
+        sig = _scan_signature(func)
+        assert sig is not None
+        # The symbolic name from the raw annotation is preferred over the shim.
+        assert sig.params[0].type_hint == "DHPrivateNumbers"
+        assert sig.return_type == "DHPrivateNumbers"
+        # And no id()-bearing repr leaked on either call site.
+        assert "0x" not in sig.params[0].type_hint
+        assert "0x" not in sig.return_type
 
 
 class TestScanFunction:

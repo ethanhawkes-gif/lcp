@@ -467,6 +467,46 @@ def _type_to_string(type_hint: Any) -> str | None:
     return _OBJECT_ADDRESS_RE.sub("", str(type_hint))
 
 
+def _is_opaque_instance(hint: Any) -> bool:
+    """True when ``hint`` is a live object carrying no symbolic name.
+
+    This is exactly the case that reaches the ``str()`` fallback in
+    ``_type_to_string()``: not ``None``/``Parameter.empty``, not a string, not
+    a ``typing`` construct, and without a ``__name__``. It is what
+    ``get_type_hints()`` yields when it collapses a forward reference to a
+    module-level instance (e.g. cryptography 50.0.0's ``_DeprecatedValue``
+    deprecation shim) instead of a class.
+    """
+    return (
+        hint is not None
+        and hint is not inspect.Parameter.empty
+        and not isinstance(hint, str)
+        and typing.get_origin(hint) is None
+        and not hasattr(hint, "__name__")
+    )
+
+
+def _prefer_raw_annotation(resolved: Any, raw: Any) -> Any:
+    """Recover the symbolic name when ``get_type_hints()`` erases it (#75).
+
+    ``get_type_hints()`` can collapse a forward reference to an opaque
+    instance with no ``__name__`` (a deprecation shim), which would otherwise
+    serialize to an ``id()``-bearing repr. When that happens and
+    ``inspect.signature`` still holds the untouched *raw* string annotation,
+    prefer the raw string so the published name matches what earlier registry
+    versions emitted (e.g. cryptography 48.0.1/49.0.0's ``'DHPrivateNumbers'``)
+    and cross-version diffs stay clean.
+
+    When no raw string is recoverable (``Parameter.empty`` or the annotation is
+    itself a live object), the resolved value is returned unchanged and the
+    ``_OBJECT_ADDRESS_RE`` backstop in ``_type_to_string()`` keeps the
+    never-emit-an-``id()`` invariant total rather than best-effort.
+    """
+    if isinstance(raw, str) and _is_opaque_instance(resolved):
+        return raw
+    return resolved
+
+
 _MAX_SYMBOLIC_EXPR = 80
 
 
@@ -654,7 +694,9 @@ def _scan_signature(obj: Any) -> ScannedSignature | None:
         if name in ("self", "cls"):
             continue
 
-        type_hint = hints.get(name, param.annotation)
+        type_hint = _prefer_raw_annotation(
+            hints.get(name, param.annotation), param.annotation
+        )
         default = param.default
         if name in primitive_default_names:
             ast_info = info.get(name)
@@ -677,7 +719,9 @@ def _scan_signature(obj: Any) -> ScannedSignature | None:
             )
         )
 
-    return_hint = hints.get("return", sig.return_annotation)
+    return_hint = _prefer_raw_annotation(
+        hints.get("return", sig.return_annotation), sig.return_annotation
+    )
     return_type = (
         _type_to_string(return_hint)
         if return_hint is not inspect.Parameter.empty
