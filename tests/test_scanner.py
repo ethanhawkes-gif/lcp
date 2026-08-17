@@ -4,6 +4,7 @@ import inspect
 import os
 import sys
 import types
+from dataclasses import InitVar
 from typing import get_type_hints
 
 import pytest
@@ -449,6 +450,16 @@ class TestScanSignature:
         # And no id()-bearing repr leaked on either call site.
         assert "0x" not in sig.params[0].type_hint
         assert "0x" not in sig.return_type
+
+    def test_forward_reference_to_custom_repr_keeps_resolved_value(self):
+        """An informative instance repr is not replaced by the raw string."""
+
+        def func(value: "InitVar[str]") -> None:
+            pass
+
+        sig = _scan_signature(func)
+        assert sig is not None
+        assert sig.params[0].type_hint == "dataclasses.InitVar[str]"
 
 
 class TestScanFunction:

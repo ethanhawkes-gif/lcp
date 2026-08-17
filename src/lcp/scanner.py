@@ -468,14 +468,16 @@ def _type_to_string(type_hint: Any) -> str | None:
 
 
 def _is_opaque_instance(hint: Any) -> bool:
-    """True when ``hint`` is a live object carrying no symbolic name.
+    """True when ``hint`` is a live object with only the default repr.
 
     This is exactly the case that reaches the ``str()`` fallback in
     ``_type_to_string()``: not ``None``/``Parameter.empty``, not a string, not
-    a ``typing`` construct, and without a ``__name__``. It is what
-    ``get_type_hints()`` yields when it collapses a forward reference to a
-    module-level instance (e.g. cryptography 50.0.0's ``_DeprecatedValue``
-    deprecation shim) instead of a class.
+    a ``typing`` construct, without a ``__name__``, and using
+    ``object.__repr__``. It is what ``get_type_hints()`` yields when it
+    collapses a forward reference to a module-level instance (e.g.
+    cryptography 50.0.0's ``_DeprecatedValue`` deprecation shim) instead of a
+    class. Instances with an informative custom repr (such as
+    ``dataclasses.InitVar[str]``) retain that representation.
     """
     return (
         hint is not None
@@ -483,6 +485,7 @@ def _is_opaque_instance(hint: Any) -> bool:
         and not isinstance(hint, str)
         and typing.get_origin(hint) is None
         and not hasattr(hint, "__name__")
+        and type(hint).__repr__ is object.__repr__
     )
 
 
