@@ -437,10 +437,20 @@ class TestScanSignature:
         """
         func = _dh_private_numbers_probe
 
-        # Precondition: get_type_hints() collapses the forward ref to the
-        # opaque instance (no __name__), exactly as cryptography 50.0.0 does.
-        resolved = get_type_hints(func)
-        assert not hasattr(resolved["return"], "__name__")
+        # Precondition: verify the problematic get_type_hints() shape.
+        # Python 3.11+ collapses the forward ref to the opaque instance (no
+        # __name__), reproducing the cryptography 50.0.0 shape.  Python 3.10
+        # raises TypeError instead ("Forward references must evaluate to types")
+        # because it enforces type-ness at hint-resolution time — a stricter
+        # variant of the same problem: get_type_hints() is unreliable, so the
+        # scanner must fall back to the raw annotation on both code paths.
+        try:
+            resolved = get_type_hints(func)
+            assert not hasattr(resolved["return"], "__name__")
+        except TypeError:
+            # Python 3.10: get_type_hints() raises rather than returning the
+            # opaque instance.  The scanner's fallback path is exercised below.
+            pass
 
         sig = _scan_signature(func)
         assert sig is not None
